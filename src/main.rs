@@ -58,6 +58,8 @@ struct PendingActions {
     open_filter: bool,
     cycle_filter: bool,
     delete: bool,
+    confirm_delete: bool,
+    cancel_delete: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,6 +107,8 @@ struct SnapView {
 
     filter_mode: FilterMode,
     filter_msg: Option<(String, f32)>,
+
+    pending_delete: Option<PathBuf>,
 }
 
 struct LoadJob {
@@ -152,6 +156,7 @@ impl SnapView {
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
+            pending_delete: None,
         };
 
         if let Some(p) = initial_path {
@@ -354,13 +359,22 @@ impl SnapView {
         self.queue_preload();
     }
 
-    fn delete_current(&mut self) {
-        let path = match self.current_path() {
+    fn request_delete(&mut self) {
+        if let Some(p) = self.current_path() {
+            self.pending_delete = Some(p);
+        }
+    }
+
+    fn confirm_delete(&mut self) {
+        let path = match self.pending_delete.take() {
             Some(p) => p,
             None => return,
         };
-        let ok = trash::delete(&path).is_ok();
-        if !ok {
+        let idx = match self.images.iter().position(|p| p == &path) {
+            Some(i) => i,
+            None => return,
+        };
+        if trash::delete(&path).is_err() {
             self.filter_msg = Some(("Delete failed".to_string(), 2.0));
             return;
         }
@@ -373,7 +387,10 @@ impl SnapView {
         self.cache.lock().unwrap().remove(&path);
         self.textures.remove(&path);
         self.rotation.remove(&path);
-        self.images.remove(self.current);
+        self.images.remove(idx);
+        if idx <= self.current && self.current > 0 {
+            self.current -= 1;
+        }
 
         if self.images.is_empty() {
             self.current = 0;
@@ -381,7 +398,6 @@ impl SnapView {
             if self.current >= self.images.len() {
                 self.current = self.images.len() - 1;
             }
-            // ensure current points to a visible image (if any visible)
             if self.visible_count() > 0 && !self.matches_filter(&self.images[self.current]) {
                 let n = self.images.len();
                 let start = self.current;
@@ -445,8 +461,19 @@ impl eframe::App for SnapView {
 
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
 
+        let modal_open = self.pending_delete.is_some();
+
         // Capture keyboard input
         ctx.input(|i| {
+            if modal_open {
+                if i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Y) {
+                    self.actions.confirm_delete = true;
+                }
+                if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::N) {
+                    self.actions.cancel_delete = true;
+                }
+                return;
+            }
             if !self.show_filter {
                 if i.key_pressed(egui::Key::ArrowRight) { self.actions.next = true; }
                 if i.key_pressed(egui::Key::ArrowLeft) { self.actions.prev = true; }
@@ -467,7 +494,7 @@ impl eframe::App for SnapView {
 
         // Mouse wheel navigation
         let scroll = ctx.input(|i| i.raw_scroll_delta.y);
-        if scroll.abs() > 1.0 && !self.show_filter {
+        if scroll.abs() > 1.0 && !self.show_filter && !modal_open {
             if scroll < 0.0 { self.actions.next = true; }
             else { self.actions.prev = true; }
         }
@@ -483,6 +510,10 @@ impl eframe::App for SnapView {
 
         if self.show_filter {
             self.render_filter_window(ctx);
+        }
+
+        if self.pending_delete.is_some() {
+            self.render_delete_confirm(ctx);
         }
 
         // Apply queued actions
@@ -509,7 +540,9 @@ impl eframe::App for SnapView {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.is_maximized));
         }
         if actions.cycle_filter { self.cycle_filter(); }
-        if actions.delete { self.delete_current(); }
+        if actions.delete { self.request_delete(); }
+        if actions.confirm_delete { self.confirm_delete(); }
+        if actions.cancel_delete { self.pending_delete = None; }
 
         // Decay transient filter message
         if let Some((_, ref mut t)) = self.filter_msg {
@@ -702,6 +735,58 @@ impl SnapView {
                 }
             }
         }
+    }
+
+    fn render_delete_confirm(&mut self, ctx: &egui::Context) {
+        let name = self.pending_delete
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("delete_dim"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    egui::Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                );
+                ui.allocate_rect(screen, egui::Sense::click());
+            });
+
+        let mut do_confirm = false;
+        let mut do_cancel = false;
+        egui::Window::new("Delete?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Move this image to trash?").size(15.0));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(name).color(egui::Color32::from_gray(200)).italics());
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("Delete  (Enter)")
+                        .fill(egui::Color32::from_rgb(160, 50, 50)))
+                        .clicked()
+                    {
+                        do_confirm = true;
+                    }
+                    if ui.button("Cancel  (Esc)").clicked() {
+                        do_cancel = true;
+                    }
+                });
+                ui.add_space(2.0);
+            });
+
+        if do_confirm { self.actions.confirm_delete = true; }
+        if do_cancel { self.actions.cancel_delete = true; }
     }
 
     fn render_filter_window(&mut self, ctx: &egui::Context) {
