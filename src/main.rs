@@ -15,12 +15,18 @@ fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = std::env::args().collect();
     let initial_path = args.get(1).map(PathBuf::from);
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 800.0])
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_title("snapview");
+
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_title("snapview"),
+        viewport,
         vsync: true,
         ..Default::default()
     };
@@ -50,6 +56,32 @@ struct PendingActions {
     toggle_max: bool,
     quit: bool,
     open_filter: bool,
+    cycle_filter: bool,
+    delete: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterMode {
+    All,
+    Favorites,
+    NonFavorites,
+}
+
+impl FilterMode {
+    fn next(self) -> Self {
+        match self {
+            FilterMode::All => FilterMode::Favorites,
+            FilterMode::Favorites => FilterMode::NonFavorites,
+            FilterMode::NonFavorites => FilterMode::All,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            FilterMode::All => "all",
+            FilterMode::Favorites => "favs only",
+            FilterMode::NonFavorites => "non-favs only",
+        }
+    }
 }
 
 struct SnapView {
@@ -70,6 +102,9 @@ struct SnapView {
 
     is_maximized: bool,
     actions: PendingActions,
+
+    filter_mode: FilterMode,
+    filter_msg: Option<(String, f32)>,
 }
 
 struct LoadJob {
@@ -115,6 +150,8 @@ impl SnapView {
             filter_selected: HashSet::new(),
             is_maximized: false,
             actions: PendingActions::default(),
+            filter_mode: FilterMode::All,
+            filter_msg: None,
         };
 
         if let Some(p) = initial_path {
@@ -244,16 +281,120 @@ impl SnapView {
         }
     }
 
-    fn next(&mut self) {
+    fn matches_filter(&self, p: &Path) -> bool {
+        match self.filter_mode {
+            FilterMode::All => true,
+            FilterMode::Favorites => self.favorites.contains(p),
+            FilterMode::NonFavorites => !self.favorites.contains(p),
+        }
+    }
+
+    fn visible_count(&self) -> usize {
+        self.images.iter().filter(|p| self.matches_filter(p)).count()
+    }
+
+    fn visible_position(&self) -> Option<usize> {
+        let cur = self.images.get(self.current)?;
+        if !self.matches_filter(cur) { return None; }
+        Some(
+            self.images[..=self.current]
+                .iter()
+                .filter(|p| self.matches_filter(p))
+                .count()
+                - 1,
+        )
+    }
+
+    fn step(&mut self, forward: bool) {
         if self.images.is_empty() { return; }
-        self.current = (self.current + 1) % self.images.len();
+        let n = self.images.len();
+        if self.visible_count() == 0 { return; }
+        let mut idx = self.current;
+        for _ in 0..n {
+            idx = if forward {
+                (idx + 1) % n
+            } else if idx == 0 {
+                n - 1
+            } else {
+                idx - 1
+            };
+            if self.matches_filter(&self.images[idx]) {
+                self.current = idx;
+                self.queue_preload();
+                return;
+            }
+        }
+    }
+
+    fn next(&mut self) { self.step(true); }
+    fn prev(&mut self) { self.step(false); }
+
+    fn cycle_filter(&mut self) {
+        self.filter_mode = self.filter_mode.next();
+        let count = self.visible_count();
+        self.filter_msg = Some((
+            format!("Filter: {}  ({} images)", self.filter_mode.label(), count),
+            1.5,
+        ));
+        if count == 0 { return; }
+        let cur_path = self.images.get(self.current).cloned();
+        let on_visible = cur_path.as_deref().map(|p| self.matches_filter(p)).unwrap_or(false);
+        if !on_visible {
+            // jump to nearest visible image (forward first)
+            let n = self.images.len();
+            let start = self.current;
+            for d in 1..=n {
+                let f = (start + d) % n;
+                if self.matches_filter(&self.images[f]) {
+                    self.current = f;
+                    break;
+                }
+            }
+        }
         self.queue_preload();
     }
 
-    fn prev(&mut self) {
-        if self.images.is_empty() { return; }
-        if self.current == 0 { self.current = self.images.len() - 1; }
-        else { self.current -= 1; }
+    fn delete_current(&mut self) {
+        let path = match self.current_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let ok = trash::delete(&path).is_ok();
+        if !ok {
+            self.filter_msg = Some(("Delete failed".to_string(), 2.0));
+            return;
+        }
+        let was_fav = self.favorites.remove(&path);
+        if was_fav {
+            if let Some(folder) = &self.folder {
+                save_favorites(folder, &self.favorites);
+            }
+        }
+        self.cache.lock().unwrap().remove(&path);
+        self.textures.remove(&path);
+        self.rotation.remove(&path);
+        self.images.remove(self.current);
+
+        if self.images.is_empty() {
+            self.current = 0;
+        } else {
+            if self.current >= self.images.len() {
+                self.current = self.images.len() - 1;
+            }
+            // ensure current points to a visible image (if any visible)
+            if self.visible_count() > 0 && !self.matches_filter(&self.images[self.current]) {
+                let n = self.images.len();
+                let start = self.current;
+                for d in 0..n {
+                    let f = (start + d) % n;
+                    if self.matches_filter(&self.images[f]) {
+                        self.current = f;
+                        break;
+                    }
+                }
+            }
+        }
+        self.filter_msg = Some(("Moved to trash".to_string(), 1.2));
         self.queue_preload();
     }
 
@@ -296,11 +437,13 @@ impl SnapView {
 
 impl eframe::App for SnapView {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
-        [0.05, 0.05, 0.05, 1.0]
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_results(ctx);
+
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
 
         // Capture keyboard input
         ctx.input(|i| {
@@ -310,7 +453,11 @@ impl eframe::App for SnapView {
                 if i.key_pressed(egui::Key::Q) { self.actions.rot_left = true; }
                 if i.key_pressed(egui::Key::W) { self.actions.rot_right = true; }
                 if i.key_pressed(egui::Key::Space) { self.actions.toggle_fav = true; }
-                if i.key_pressed(egui::Key::F) { self.actions.open_filter = true; }
+                if i.key_pressed(egui::Key::F) {
+                    if i.modifiers.shift { self.actions.open_filter = true; }
+                    else { self.actions.cycle_filter = true; }
+                }
+                if i.key_pressed(egui::Key::Delete) { self.actions.delete = true; }
                 if i.key_pressed(egui::Key::Escape) { self.actions.quit = true; }
                 if i.key_pressed(egui::Key::O) && i.modifiers.ctrl { self.actions.open_folder = true; }
                 if i.key_pressed(egui::Key::F11) { self.actions.toggle_max = true; }
@@ -325,12 +472,13 @@ impl eframe::App for SnapView {
             else { self.actions.prev = true; }
         }
 
-        let panel_frame = egui::Frame::none().fill(egui::Color32::from_rgb(13, 13, 13));
+        let bg_alpha: u8 = if focused { 235 } else { 0 };
+        let panel_frame = egui::Frame::none()
+            .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
             self.render_image(ui, ctx);
             self.render_overlay(ui);
-            self.handle_context_menu(ui);
-            self.handle_window_drag(ui, ctx);
+            self.handle_background_interaction(ui, ctx);
         });
 
         if self.show_filter {
@@ -359,6 +507,18 @@ impl eframe::App for SnapView {
         if actions.toggle_max {
             self.is_maximized = !self.is_maximized;
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.is_maximized));
+        }
+        if actions.cycle_filter { self.cycle_filter(); }
+        if actions.delete { self.delete_current(); }
+
+        // Decay transient filter message
+        if let Some((_, ref mut t)) = self.filter_msg {
+            let dt = ctx.input(|i| i.unstable_dt);
+            *t -= dt;
+            if *t > 0.0 { ctx.request_repaint(); }
+        }
+        if matches!(&self.filter_msg, Some((_, t)) if *t <= 0.0) {
+            self.filter_msg = None;
         }
     }
 }
@@ -429,7 +589,12 @@ impl SnapView {
         };
         let is_fav = self.favorites.contains(&path);
         let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let counter = format!("{} / {}", self.current + 1, self.images.len());
+        let counter = if self.filter_mode == FilterMode::All {
+            format!("{} / {}", self.current + 1, self.images.len())
+        } else {
+            let pos = self.visible_position().map(|p| p + 1).unwrap_or(0);
+            format!("{} / {}  ({})", pos, self.visible_count(), self.filter_mode.label())
+        };
         let fav_count = self.favorites.len();
 
         let painter = ui.painter();
@@ -460,18 +625,38 @@ impl SnapView {
                 egui::Color32::from_rgba_premultiplied(220, 220, 220, 180)
             },
         );
+
+        if let Some((msg, t)) = &self.filter_msg {
+            let alpha = (t.min(1.0) * 230.0).clamp(0.0, 230.0) as u8;
+            painter.text(
+                egui::pos2(rect.center().x, rect.top() + 24.0),
+                egui::Align2::CENTER_TOP,
+                msg,
+                egui::FontId::proportional(16.0),
+                egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha),
+            );
+        }
     }
 
-    fn handle_context_menu(&mut self, ui: &mut egui::Ui) {
+    fn handle_background_interaction(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let resp = ui.interact(
             ui.available_rect_before_wrap(),
             egui::Id::new("bg_interact"),
             egui::Sense::click_and_drag(),
         );
+
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if resp.double_clicked() {
+            self.actions.toggle_max = true;
+        }
+
         let is_fav_now = self.current_path()
             .map(|p| self.favorites.contains(&p))
             .unwrap_or(false);
         let fav_total = self.favorites.len();
+        let filter_label = self.filter_mode.label();
 
         resp.context_menu(|ui| {
             if ui.button("Open folder…  (Ctrl+O)").clicked() {
@@ -487,28 +672,20 @@ impl SnapView {
             ui.separator();
             let label = if is_fav_now { "Unmark favorite  (Space)" } else { "Mark favorite  (Space)" };
             if ui.button(label).clicked() { self.actions.toggle_fav = true; ui.close_menu(); }
-            if ui.button(format!("Filter favorites…  (F)  [{}]", fav_total)).clicked() {
+            if ui.button(format!("Cycle filter  (F)  [{}]", filter_label)).clicked() {
+                self.actions.cycle_filter = true;
+                ui.close_menu();
+            }
+            if ui.button(format!("Filter favorites window…  (Shift+F)  [{}]", fav_total)).clicked() {
                 self.actions.open_filter = true;
                 ui.close_menu();
             }
             ui.separator();
+            if ui.button("Move to trash  (Delete)").clicked() { self.actions.delete = true; ui.close_menu(); }
+            ui.separator();
             if ui.button("Toggle maximize  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
         });
-    }
-
-    fn handle_window_drag(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let resp = ui.interact(
-            ui.available_rect_before_wrap(),
-            egui::Id::new("drag_zone"),
-            egui::Sense::click_and_drag(),
-        );
-        if resp.drag_started_by(egui::PointerButton::Primary) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-        if resp.double_clicked() {
-            self.actions.toggle_max = true;
-        }
     }
 
     fn handle_drop(&mut self, ctx: &egui::Context) {
@@ -610,7 +787,9 @@ fn is_image(p: &Path) -> bool {
 
 fn decode_image(path: &Path) -> LoadedImage {
     match image::open(path) {
-        Ok(img) => {
+        Ok(mut img) => {
+            let orient = read_exif_orientation(path).unwrap_or(1);
+            img = apply_exif_orientation(img, orient);
             let rgba = img.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let pixels = rgba.into_raw();
@@ -619,6 +798,45 @@ fn decode_image(path: &Path) -> LoadedImage {
         }
         Err(_) => LoadedImage::Failed,
     }
+}
+
+fn read_exif_orientation(path: &Path) -> Option<u32> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+    let field = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?;
+    field.value.get_uint(0)
+}
+
+fn apply_exif_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
+    use image::DynamicImage;
+    match orientation {
+        2 => DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&img)),
+        3 => img.rotate180(),
+        4 => DynamicImage::ImageRgba8(image::imageops::flip_vertical(&img)),
+        5 => {
+            let r = img.rotate90();
+            DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&r))
+        }
+        6 => img.rotate90(),
+        7 => {
+            let r = img.rotate270();
+            DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&r))
+        }
+        8 => img.rotate270(),
+        _ => img,
+    }
+}
+
+fn load_app_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../assets/icon.png");
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width: w,
+        height: h,
+    })
 }
 
 fn favorites_path(folder: &Path) -> PathBuf {

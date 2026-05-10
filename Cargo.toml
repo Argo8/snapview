@@ -10,6 +10,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rfd = "0.15"
 walkdir = "2.5"
 rayon = "1.10"
+kamadak-exif = "0.6"
+trash = "5"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = 3
