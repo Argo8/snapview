@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
+const THUMB_MAX: u32 = 256;
 const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
     "rw2", "pef", "ptx", "srw", "dng", "raw", "rwl", "3fr", "fff", "erf",
@@ -104,13 +105,17 @@ struct SnapView {
     rotation: HashMap<PathBuf, i32>,
     sidecars: HashMap<PathBuf, Vec<PathBuf>>,
 
-    load_tx: mpsc::Sender<LoadJob>,
-    result_rx: mpsc::Receiver<(PathBuf, LoadedImage)>,
+    thumb_cache: Arc<Mutex<HashMap<PathBuf, LoadedImage>>>,
+    thumb_textures: HashMap<PathBuf, egui::TextureHandle>,
+
+    full_tx: mpsc::Sender<PathBuf>,
+    thumb_tx: mpsc::Sender<PathBuf>,
+    result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
     filter_selected: HashSet<PathBuf>,
 
-    is_maximized: bool,
+    is_fullscreen: bool,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -120,31 +125,48 @@ struct SnapView {
     last_image_rect: Option<egui::Rect>,
 }
 
-struct LoadJob {
-    path: PathBuf,
+enum JobResult {
+    Full(PathBuf, LoadedImage),
+    Thumb(PathBuf, LoadedImage),
 }
 
 impl SnapView {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
-        let (load_tx, load_rx) = mpsc::channel::<LoadJob>();
-        let (result_tx, result_rx) = mpsc::channel::<(PathBuf, LoadedImage)>();
-        let load_rx = Arc::new(Mutex::new(load_rx));
+        let (full_tx, full_rx) = mpsc::channel::<PathBuf>();
+        let (thumb_tx, thumb_rx) = mpsc::channel::<PathBuf>();
+        let (result_tx, result_rx) = mpsc::channel::<JobResult>();
+        let full_rx = Arc::new(Mutex::new(full_rx));
+        let thumb_rx = Arc::new(Mutex::new(thumb_rx));
 
-        let n_workers = num_workers();
-        for _ in 0..n_workers {
-            let rx = Arc::clone(&load_rx);
+        let total = num_workers();
+        let n_full = (total / 2).max(2);
+        let n_thumb = (total - n_full).max(1);
+
+        for _ in 0..n_full {
+            let rx = Arc::clone(&full_rx);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
             thread::spawn(move || loop {
-                let job = {
+                let path = {
                     let lock = rx.lock().unwrap();
-                    match lock.recv() {
-                        Ok(j) => j,
-                        Err(_) => break,
-                    }
+                    match lock.recv() { Ok(p) => p, Err(_) => break }
                 };
-                let result = decode_image(&job.path);
-                let _ = tx.send((job.path, result));
+                let r = decode_image(&path);
+                let _ = tx.send(JobResult::Full(path, r));
+                ctx.request_repaint();
+            });
+        }
+        for _ in 0..n_thumb {
+            let rx = Arc::clone(&thumb_rx);
+            let tx = result_tx.clone();
+            let ctx = cc.egui_ctx.clone();
+            thread::spawn(move || loop {
+                let path = {
+                    let lock = rx.lock().unwrap();
+                    match lock.recv() { Ok(p) => p, Err(_) => break }
+                };
+                let r = decode_thumb(&path);
+                let _ = tx.send(JobResult::Thumb(path, r));
                 ctx.request_repaint();
             });
         }
@@ -158,11 +180,14 @@ impl SnapView {
             textures: HashMap::new(),
             rotation: HashMap::new(),
             sidecars: HashMap::new(),
-            load_tx,
+            thumb_cache: Arc::new(Mutex::new(HashMap::new())),
+            thumb_textures: HashMap::new(),
+            full_tx,
+            thumb_tx,
             result_rx,
             show_filter: false,
             filter_selected: HashSet::new(),
-            is_maximized: false,
+            is_fullscreen: false,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
@@ -217,8 +242,31 @@ impl SnapView {
         self.images = images;
         self.sidecars = sidecars;
         self.cache.lock().unwrap().clear();
+        self.thumb_cache.lock().unwrap().clear();
         self.textures.clear();
+        self.thumb_textures.clear();
         self.rotation.clear();
+
+        // Queue thumbnails for every image, in order from current outward so visible region loads first
+        let n = self.images.len();
+        let cur = if let Some(sel) = &select {
+            self.images.iter().position(|p| p == sel).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        order.push(cur);
+        for d in 1..n {
+            if cur + d < n { order.push(cur + d); }
+            if cur >= d { order.push(cur - d); }
+        }
+        let mut tcache = self.thumb_cache.lock().unwrap();
+        for i in order {
+            let p = self.images[i].clone();
+            tcache.insert(p.clone(), LoadedImage::Loading);
+            let _ = self.thumb_tx.send(p);
+        }
+        drop(tcache);
 
         self.current = if let Some(sel) = select {
             self.images.iter().position(|p| p == &sel).unwrap_or(0)
@@ -252,24 +300,40 @@ impl SnapView {
         drop(cache);
 
         for p in to_queue {
-            let _ = self.load_tx.send(LoadJob { path: p });
+            let _ = self.full_tx.send(p);
         }
     }
 
     fn drain_results(&mut self, ctx: &egui::Context) {
-        while let Ok((path, result)) = self.result_rx.try_recv() {
-            let mut cache = self.cache.lock().unwrap();
-            cache.insert(path.clone(), result.clone());
-            drop(cache);
-
-            if let LoadedImage::Ready(ci) = result {
-                if self.is_near_current(&path) {
-                    let tex = ctx.load_texture(
-                        path.to_string_lossy().to_string(),
-                        (*ci).clone(),
-                        egui::TextureOptions::LINEAR,
-                    );
-                    self.textures.insert(path, tex);
+        while let Ok(res) = self.result_rx.try_recv() {
+            match res {
+                JobResult::Full(path, result) => {
+                    let mut cache = self.cache.lock().unwrap();
+                    cache.insert(path.clone(), result.clone());
+                    drop(cache);
+                    if let LoadedImage::Ready(ci) = result {
+                        if self.is_near_current(&path) {
+                            let tex = ctx.load_texture(
+                                path.to_string_lossy().to_string(),
+                                (*ci).clone(),
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.textures.insert(path, tex);
+                        }
+                    }
+                }
+                JobResult::Thumb(path, result) => {
+                    let mut tc = self.thumb_cache.lock().unwrap();
+                    tc.insert(path.clone(), result.clone());
+                    drop(tc);
+                    if let LoadedImage::Ready(ci) = result {
+                        let tex = ctx.load_texture(
+                            format!("thumb:{}", path.to_string_lossy()),
+                            (*ci).clone(),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.thumb_textures.insert(path, tex);
+                    }
                 }
             }
         }
@@ -415,7 +479,9 @@ impl SnapView {
             }
         }
         self.cache.lock().unwrap().remove(&path);
+        self.thumb_cache.lock().unwrap().remove(&path);
         self.textures.remove(&path);
+        self.thumb_textures.remove(&path);
         self.rotation.remove(&path);
         self.sidecars.remove(&path);
         self.images.remove(idx);
@@ -557,7 +623,7 @@ impl eframe::App for SnapView {
         }
 
         let portrait = self.current_is_portrait();
-        let suppress_dim = portrait && !self.is_maximized;
+        let suppress_dim = portrait && !self.is_fullscreen;
         let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
@@ -595,8 +661,8 @@ impl eframe::App for SnapView {
             }
         }
         if actions.toggle_max {
-            self.is_maximized = !self.is_maximized;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.is_maximized));
+            self.is_fullscreen = !self.is_fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
         }
         if actions.cycle_filter { self.cycle_filter(); }
         if actions.delete { self.request_delete(); }
@@ -637,7 +703,10 @@ impl SnapView {
 
         let rotation_quarter = *self.rotation.get(&path).unwrap_or(&0);
 
-        if let Some(tex) = self.textures.get(&path) {
+        let tex_opt = self.textures.get(&path).cloned()
+            .or_else(|| self.thumb_textures.get(&path).cloned());
+
+        if let Some(tex) = tex_opt {
             let img_size = tex.size_vec2();
             let (fit_w, fit_h) = if rotation_quarter % 2 == 0 {
                 (img_size.x, img_size.y)
@@ -785,7 +854,7 @@ impl SnapView {
             ui.separator();
             if ui.button("Move to trash  (Delete)").clicked() { self.actions.delete = true; ui.close_menu(); }
             ui.separator();
-            if ui.button("Toggle maximize  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
+            if ui.button("Toggle fullscreen  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
         });
     }
@@ -966,6 +1035,22 @@ fn decode_image(path: &Path) -> LoadedImage {
             let orient = read_exif_orientation(path).unwrap_or(1);
             img = apply_exif_orientation(img, orient);
             let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let pixels = rgba.into_raw();
+            let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+            LoadedImage::Ready(Arc::new(ci))
+        }
+        Err(_) => LoadedImage::Failed,
+    }
+}
+
+fn decode_thumb(path: &Path) -> LoadedImage {
+    match image::open(path) {
+        Ok(mut img) => {
+            let orient = read_exif_orientation(path).unwrap_or(1);
+            img = apply_exif_orientation(img, orient);
+            let small = img.thumbnail(THUMB_MAX, THUMB_MAX);
+            let rgba = small.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let pixels = rgba.into_raw();
             let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
