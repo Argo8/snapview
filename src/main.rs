@@ -8,6 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
+const RAW_EXTS: &[&str] = &[
+    "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
+    "rw2", "pef", "ptx", "srw", "dng", "raw", "rwl", "3fr", "fff", "erf",
+    "iiq", "mef", "mos", "mrw", "x3f", "x3i", "kdc", "dcr", "ari", "bay",
+    "cap", "dcs", "drf", "k25", "mdc", "obm", "ori", "pxn", "r3d", "rwz",
+    "xmp",
+];
 const FAVORITES_FILE: &str = ".favorites.txt";
 const PRELOAD_RADIUS: usize = 2;
 
@@ -95,6 +102,7 @@ struct SnapView {
     cache: Arc<Mutex<HashMap<PathBuf, LoadedImage>>>,
     textures: HashMap<PathBuf, egui::TextureHandle>,
     rotation: HashMap<PathBuf, i32>,
+    sidecars: HashMap<PathBuf, Vec<PathBuf>>,
 
     load_tx: mpsc::Sender<LoadJob>,
     result_rx: mpsc::Receiver<(PathBuf, LoadedImage)>,
@@ -148,6 +156,7 @@ impl SnapView {
             cache: Arc::new(Mutex::new(HashMap::new())),
             textures: HashMap::new(),
             rotation: HashMap::new(),
+            sidecars: HashMap::new(),
             load_tx,
             result_rx,
             show_filter: false,
@@ -177,19 +186,34 @@ impl SnapView {
     }
 
     fn open_folder(&mut self, folder: &Path, select: Option<PathBuf>) {
-        let mut images: Vec<PathBuf> = std::fs::read_dir(folder)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| is_image(p))
-                    .collect()
-            })
+        let all: Vec<PathBuf> = std::fs::read_dir(folder)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
             .unwrap_or_default();
+
+        let mut images: Vec<PathBuf> = all.iter().filter(|p| is_image(p)).cloned().collect();
         images.sort();
+
+        // Group raw sidecars by stem
+        let mut by_stem: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for p in &all {
+            if !is_raw_sidecar(p) { continue; }
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                by_stem.entry(stem.to_lowercase()).or_default().push(p.clone());
+            }
+        }
+        let mut sidecars: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        for img in &images {
+            if let Some(stem) = img.file_stem().and_then(|s| s.to_str()) {
+                if let Some(list) = by_stem.get(&stem.to_lowercase()) {
+                    sidecars.insert(img.clone(), list.clone());
+                }
+            }
+        }
 
         self.folder = Some(folder.to_path_buf());
         self.favorites = load_favorites(folder, &images);
         self.images = images;
+        self.sidecars = sidecars;
         self.cache.lock().unwrap().clear();
         self.textures.clear();
         self.rotation.clear();
@@ -211,7 +235,7 @@ impl SnapView {
         let mut to_queue: Vec<PathBuf> = Vec::new();
         let mut cache = self.cache.lock().unwrap();
 
-        let mut consider = |to_queue: &mut Vec<PathBuf>, cache: &mut HashMap<PathBuf, LoadedImage>, p: &PathBuf| {
+        let consider = |to_queue: &mut Vec<PathBuf>, cache: &mut HashMap<PathBuf, LoadedImage>, p: &PathBuf| {
             if !cache.contains_key(p) {
                 cache.insert(p.clone(), LoadedImage::Loading);
                 to_queue.push(p.clone());
@@ -374,7 +398,11 @@ impl SnapView {
             Some(i) => i,
             None => return,
         };
-        if trash::delete(&path).is_err() {
+        let mut to_trash: Vec<PathBuf> = vec![path.clone()];
+        if let Some(side) = self.sidecars.get(&path) {
+            to_trash.extend(side.iter().cloned());
+        }
+        if trash::delete_all(&to_trash).is_err() {
             self.filter_msg = Some(("Delete failed".to_string(), 2.0));
             return;
         }
@@ -387,6 +415,7 @@ impl SnapView {
         self.cache.lock().unwrap().remove(&path);
         self.textures.remove(&path);
         self.rotation.remove(&path);
+        self.sidecars.remove(&path);
         self.images.remove(idx);
         if idx <= self.current && self.current > 0 {
             self.current -= 1;
@@ -410,7 +439,13 @@ impl SnapView {
                 }
             }
         }
-        self.filter_msg = Some(("Moved to trash".to_string(), 1.2));
+        let extra = to_trash.len() - 1;
+        let msg = if extra > 0 {
+            format!("Moved to trash (+ {} sidecar{})", extra, if extra == 1 { "" } else { "s" })
+        } else {
+            "Moved to trash".to_string()
+        };
+        self.filter_msg = Some((msg, 1.2));
         self.queue_preload();
     }
 
@@ -437,17 +472,37 @@ impl SnapView {
         self.images.get(self.current).cloned()
     }
 
-    fn copy_filtered(&self, dest: &Path) -> std::io::Result<usize> {
+    fn current_is_portrait(&self) -> bool {
+        let path = match self.current_path() { Some(p) => p, None => return false };
+        let cache = self.cache.lock().unwrap();
+        if let Some(LoadedImage::Ready(ci)) = cache.get(&path) {
+            let rot = *self.rotation.get(&path).unwrap_or(&0);
+            let (w, h) = (ci.size[0], ci.size[1]);
+            let (w, h) = if rot.rem_euclid(2) == 0 { (w, h) } else { (h, w) };
+            return h > w;
+        }
+        false
+    }
+
+    fn copy_filtered(&self, dest: &Path) -> std::io::Result<(usize, usize)> {
         std::fs::create_dir_all(dest)?;
         let mut count = 0;
+        let mut side_count = 0;
         for src in &self.filter_selected {
             if let Some(name) = src.file_name() {
-                let target = dest.join(name);
-                std::fs::copy(src, &target)?;
+                std::fs::copy(src, dest.join(name))?;
                 count += 1;
             }
+            if let Some(sides) = self.sidecars.get(src) {
+                for s in sides {
+                    if let Some(name) = s.file_name() {
+                        std::fs::copy(s, dest.join(name))?;
+                        side_count += 1;
+                    }
+                }
+            }
         }
-        Ok(count)
+        Ok((count, side_count))
     }
 }
 
@@ -499,7 +554,9 @@ impl eframe::App for SnapView {
             else { self.actions.prev = true; }
         }
 
-        let bg_alpha: u8 = if focused { 235 } else { 0 };
+        let portrait = self.current_is_portrait();
+        let suppress_dim = portrait && !self.is_maximized;
+        let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
@@ -622,12 +679,17 @@ impl SnapView {
         };
         let is_fav = self.favorites.contains(&path);
         let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let counter = if self.filter_mode == FilterMode::All {
+        let mut counter = if self.filter_mode == FilterMode::All {
             format!("{} / {}", self.current + 1, self.images.len())
         } else {
             let pos = self.visible_position().map(|p| p + 1).unwrap_or(0);
             format!("{} / {}  ({})", pos, self.visible_count(), self.filter_mode.label())
         };
+        if let Some(sides) = self.sidecars.get(&path) {
+            if !sides.is_empty() {
+                counter.push_str(&format!("   ·   +{} RAW", sides.len()));
+            }
+        }
         let fav_count = self.favorites.len();
 
         let painter = ui.painter();
@@ -738,10 +800,11 @@ impl SnapView {
     }
 
     fn render_delete_confirm(&mut self, ctx: &egui::Context) {
-        let name = self.pending_delete
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().to_string())
+        let path = match &self.pending_delete { Some(p) => p.clone(), None => return };
+        let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let side_count = self.sidecars.get(&path).map(|v| v.len()).unwrap_or(0);
+        let side_names: Vec<String> = self.sidecars.get(&path)
+            .map(|v| v.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).collect())
             .unwrap_or_default();
 
         let screen = ctx.screen_rect();
@@ -767,9 +830,17 @@ impl SnapView {
             .show(ctx, |ui| {
                 ui.set_min_width(360.0);
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new("Move this image to trash?").size(15.0));
+                let header = if side_count > 0 {
+                    format!("Move this image and {} RAW/sidecar file{} to trash?", side_count, if side_count == 1 { "" } else { "s" })
+                } else {
+                    "Move this image to trash?".to_string()
+                };
+                ui.label(egui::RichText::new(header).size(15.0));
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(name).color(egui::Color32::from_gray(200)).italics());
+                ui.label(egui::RichText::new(&name).color(egui::Color32::from_gray(200)).italics());
+                for sn in &side_names {
+                    ui.label(egui::RichText::new(format!("+ {}", sn)).color(egui::Color32::from_gray(160)).italics().size(12.0));
+                }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.add(egui::Button::new("Delete  (Enter)")
@@ -841,10 +912,15 @@ impl SnapView {
         if do_copy {
             if let Some(dest) = rfd::FileDialog::new().pick_folder() {
                 match self.copy_filtered(&dest) {
-                    Ok(n) => {
+                    Ok((n, s)) => {
+                        let desc = if s > 0 {
+                            format!("Copied {} images + {} RAW/sidecar files.", n, s)
+                        } else {
+                            format!("Copied {} files.", n)
+                        };
                         rfd::MessageDialog::new()
                             .set_title("Done")
-                            .set_description(format!("Copied {} files.", n))
+                            .set_description(desc)
                             .show();
                     }
                     Err(e) => {
@@ -867,6 +943,13 @@ fn is_image(p: &Path) -> bool {
     p.extension()
         .and_then(|s| s.to_str())
         .map(|s| SUPPORTED_EXTS.iter().any(|e| e.eq_ignore_ascii_case(s)))
+        .unwrap_or(false)
+}
+
+fn is_raw_sidecar(p: &Path) -> bool {
+    p.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| RAW_EXTS.iter().any(|e| e.eq_ignore_ascii_case(s)))
         .unwrap_or(false)
 }
 
