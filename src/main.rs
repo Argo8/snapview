@@ -117,6 +117,7 @@ struct SnapView {
     filter_msg: Option<(String, f32)>,
 
     pending_delete: Option<PathBuf>,
+    last_image_rect: Option<egui::Rect>,
 }
 
 struct LoadJob {
@@ -166,6 +167,7 @@ impl SnapView {
             filter_mode: FilterMode::All,
             filter_msg: None,
             pending_delete: None,
+            last_image_rect: None,
         };
 
         if let Some(p) = initial_path {
@@ -658,6 +660,11 @@ impl SnapView {
             mesh.rotate(egui::emath::Rot2::from_angle(angle), egui::Pos2::ZERO);
             mesh.translate(center.to_vec2());
             ui.painter().add(egui::Shape::mesh(mesh));
+
+            self.last_image_rect = Some(egui::Rect::from_center_size(
+                center,
+                egui::vec2(fit_w * scale, fit_h * scale),
+            ));
         } else {
             ui.centered_and_justified(|ui| {
                 ui.label(
@@ -693,7 +700,7 @@ impl SnapView {
         let fav_count = self.favorites.len();
 
         let painter = ui.painter();
-        let rect = ui.available_rect_before_wrap();
+        let rect = self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
 
         let text = format!("{}   ·   {}", name, counter);
         painter.text(
