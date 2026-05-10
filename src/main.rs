@@ -627,7 +627,7 @@ impl SnapView {
         );
 
         if let Some((msg, t)) = &self.filter_msg {
-            let alpha = (t.min(&1.0) * 230.0).clamp(0.0, 230.0) as u8;
+            let alpha = (t.min(1.0) * 230.0).clamp(0.0, 230.0) as u8;
             painter.text(
                 egui::pos2(rect.center().x, rect.top() + 24.0),
                 egui::Align2::CENTER_TOP,
