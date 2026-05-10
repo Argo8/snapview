@@ -1,10 +1,10 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 use eframe::egui;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
@@ -48,7 +48,6 @@ fn main() -> Result<(), eframe::Error> {
 
 #[derive(Clone)]
 enum LoadedImage {
-    Loading,
     Ready(Arc<egui::ColorImage>),
     Failed,
 }
@@ -109,8 +108,8 @@ struct SnapView {
     thumb_textures: HashMap<PathBuf, egui::TextureHandle>,
     full_dims: HashMap<PathBuf, [usize; 2]>,
 
-    full_tx: mpsc::Sender<PathBuf>,
-    thumb_tx: mpsc::Sender<PathBuf>,
+    full_q: Arc<PrioQueue>,
+    thumb_q: Arc<PrioQueue>,
     result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
@@ -137,41 +136,98 @@ enum JobResult {
     Thumb(PathBuf, LoadedImage, Option<[usize; 2]>),
 }
 
+struct PrioQueueInner {
+    queue: VecDeque<PathBuf>,
+    in_queue: HashSet<PathBuf>,
+    closed: bool,
+}
+
+struct PrioQueue {
+    inner: Mutex<PrioQueueInner>,
+    cv: Condvar,
+}
+
+impl PrioQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(PrioQueueInner {
+                queue: VecDeque::new(),
+                in_queue: HashSet::new(),
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn enqueue_back(&self, paths: &[PathBuf]) {
+        let mut g = self.inner.lock().unwrap();
+        for p in paths {
+            if g.in_queue.insert(p.clone()) {
+                g.queue.push_back(p.clone());
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    fn prioritize(&self, paths: &[PathBuf]) {
+        let mut g = self.inner.lock().unwrap();
+        for p in paths.iter().rev() {
+            if let Some(pos) = g.queue.iter().position(|x| x == p) {
+                g.queue.remove(pos);
+                g.queue.push_front(p.clone());
+            } else if g.in_queue.insert(p.clone()) {
+                g.queue.push_front(p.clone());
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    fn clear(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.queue.clear();
+        g.in_queue.clear();
+    }
+
+    fn pop(&self) -> Option<PathBuf> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if let Some(p) = g.queue.pop_front() {
+                g.in_queue.remove(&p);
+                return Some(p);
+            }
+            if g.closed { return None; }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
 impl SnapView {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
-        let (full_tx, full_rx) = mpsc::channel::<PathBuf>();
-        let (thumb_tx, thumb_rx) = mpsc::channel::<PathBuf>();
         let (result_tx, result_rx) = mpsc::channel::<JobResult>();
-        let full_rx = Arc::new(Mutex::new(full_rx));
-        let thumb_rx = Arc::new(Mutex::new(thumb_rx));
+        let full_q = PrioQueue::new();
+        let thumb_q = PrioQueue::new();
 
         let total = num_workers();
         let n_full = (total / 2).max(2);
         let n_thumb = (total - n_full).max(1);
 
         for _ in 0..n_full {
-            let rx = Arc::clone(&full_rx);
+            let q = Arc::clone(&full_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
             thread::spawn(move || loop {
-                let path = {
-                    let lock = rx.lock().unwrap();
-                    match lock.recv() { Ok(p) => p, Err(_) => break }
-                };
+                let path = match q.pop() { Some(p) => p, None => break };
                 let r = decode_image(&path);
                 let _ = tx.send(JobResult::Full(path, r));
                 ctx.request_repaint();
             });
         }
         for _ in 0..n_thumb {
-            let rx = Arc::clone(&thumb_rx);
+            let q = Arc::clone(&thumb_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
             thread::spawn(move || loop {
-                let path = {
-                    let lock = rx.lock().unwrap();
-                    match lock.recv() { Ok(p) => p, Err(_) => break }
-                };
+                let path = match q.pop() { Some(p) => p, None => break };
                 let (r, dims) = decode_thumb(&path);
                 let _ = tx.send(JobResult::Thumb(path, r, dims));
                 ctx.request_repaint();
@@ -190,8 +246,8 @@ impl SnapView {
             thumb_cache: Arc::new(Mutex::new(HashMap::new())),
             thumb_textures: HashMap::new(),
             full_dims: HashMap::new(),
-            full_tx,
-            thumb_tx,
+            full_q,
+            thumb_q,
             result_rx,
             show_filter: false,
             filter_selected: HashSet::new(),
@@ -261,26 +317,23 @@ impl SnapView {
         self.full_dims.clear();
         self.rotation.clear();
 
-        // Queue thumbnails for every image, in order from current outward so visible region loads first
+        self.thumb_q.clear();
+        self.full_q.clear();
+
         let n = self.images.len();
         let cur = if let Some(sel) = &select {
             self.images.iter().position(|p| p == sel).unwrap_or(0)
         } else {
             0
         };
-        let mut order: Vec<usize> = Vec::with_capacity(n);
-        order.push(cur);
+        // Bulk fill: every image, in order radiating outward from `cur`.
+        let mut order: Vec<PathBuf> = Vec::with_capacity(n);
+        if n > 0 { order.push(self.images[cur].clone()); }
         for d in 1..n {
-            if cur + d < n { order.push(cur + d); }
-            if cur >= d { order.push(cur - d); }
+            if cur + d < n { order.push(self.images[cur + d].clone()); }
+            if cur >= d { order.push(self.images[cur - d].clone()); }
         }
-        let mut tcache = self.thumb_cache.lock().unwrap();
-        for i in order {
-            let p = self.images[i].clone();
-            tcache.insert(p.clone(), LoadedImage::Loading);
-            let _ = self.thumb_tx.send(p);
-        }
-        drop(tcache);
+        self.thumb_q.enqueue_back(&order);
 
         self.current = if let Some(sel) = select {
             self.images.iter().position(|p| p == &sel).unwrap_or(0)
@@ -289,6 +342,30 @@ impl SnapView {
         };
 
         self.queue_preload();
+        self.prioritize_thumbs();
+    }
+
+    fn prioritize_thumbs(&self) {
+        if self.images.is_empty() { return; }
+        const RADIUS: usize = 12;
+        let n = self.images.len();
+        let cur = self.current;
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(RADIUS * 2 + 1);
+        paths.push(self.images[cur].clone());
+        for d in 1..=RADIUS {
+            if cur + d < n { paths.push(self.images[cur + d].clone()); }
+            if cur >= d { paths.push(self.images[cur - d].clone()); }
+        }
+        // Drop already-loaded ones from the priority list.
+        let cache = self.thumb_cache.lock().unwrap();
+        let pending: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| !matches!(cache.get(p), Some(LoadedImage::Ready(_)) | Some(LoadedImage::Failed)))
+            .collect();
+        drop(cache);
+        if !pending.is_empty() {
+            self.thumb_q.prioritize(&pending);
+        }
     }
 
     fn queue_preload(&self) {
@@ -296,25 +373,20 @@ impl SnapView {
         let n = self.images.len();
         let cur = self.current;
 
-        let mut to_queue: Vec<PathBuf> = Vec::new();
-        let mut cache = self.cache.lock().unwrap();
-
-        let consider = |to_queue: &mut Vec<PathBuf>, cache: &mut HashMap<PathBuf, LoadedImage>, p: &PathBuf| {
-            if !cache.contains_key(p) {
-                cache.insert(p.clone(), LoadedImage::Loading);
-                to_queue.push(p.clone());
-            }
-        };
-
-        consider(&mut to_queue, &mut cache, &self.images[cur]);
+        let mut paths: Vec<PathBuf> = Vec::new();
+        paths.push(self.images[cur].clone());
         for d in 1..=PRELOAD_RADIUS {
-            if cur + d < n { consider(&mut to_queue, &mut cache, &self.images[cur + d]); }
-            if cur >= d { consider(&mut to_queue, &mut cache, &self.images[cur - d]); }
+            if cur + d < n { paths.push(self.images[cur + d].clone()); }
+            if cur >= d { paths.push(self.images[cur - d].clone()); }
         }
+        let cache = self.cache.lock().unwrap();
+        let pending: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| !matches!(cache.get(p), Some(LoadedImage::Ready(_)) | Some(LoadedImage::Failed)))
+            .collect();
         drop(cache);
-
-        for p in to_queue {
-            let _ = self.full_tx.send(p);
+        if !pending.is_empty() {
+            self.full_q.prioritize(&pending);
         }
     }
 
@@ -431,6 +503,7 @@ impl SnapView {
             if self.matches_filter(&self.images[idx]) {
                 self.current = idx;
                 self.queue_preload();
+                self.prioritize_thumbs();
                 return;
             }
         }
@@ -462,6 +535,7 @@ impl SnapView {
             }
         }
         self.queue_preload();
+        self.prioritize_thumbs();
     }
 
     fn request_delete(&mut self) {
@@ -530,6 +604,7 @@ impl SnapView {
         };
         self.filter_msg = Some((msg, 1.2));
         self.queue_preload();
+        self.prioritize_thumbs();
     }
 
     fn rotate(&mut self, delta: i32) {
