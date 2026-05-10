@@ -15,12 +15,18 @@ fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = std::env::args().collect();
     let initial_path = args.get(1).map(PathBuf::from);
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 800.0])
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_title("snapview");
+
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_title("snapview"),
+        viewport,
         vsync: true,
         ..Default::default()
     };
@@ -296,11 +302,13 @@ impl SnapView {
 
 impl eframe::App for SnapView {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
-        [0.05, 0.05, 0.05, 1.0]
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_results(ctx);
+
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
 
         // Capture keyboard input
         ctx.input(|i| {
@@ -325,12 +333,13 @@ impl eframe::App for SnapView {
             else { self.actions.prev = true; }
         }
 
-        let panel_frame = egui::Frame::none().fill(egui::Color32::from_rgb(13, 13, 13));
+        let bg_alpha: u8 = if focused { 235 } else { 0 };
+        let panel_frame = egui::Frame::none()
+            .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
             self.render_image(ui, ctx);
             self.render_overlay(ui);
-            self.handle_context_menu(ui);
-            self.handle_window_drag(ui, ctx);
+            self.handle_background_interaction(ui, ctx);
         });
 
         if self.show_filter {
@@ -462,12 +471,20 @@ impl SnapView {
         );
     }
 
-    fn handle_context_menu(&mut self, ui: &mut egui::Ui) {
+    fn handle_background_interaction(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let resp = ui.interact(
             ui.available_rect_before_wrap(),
             egui::Id::new("bg_interact"),
             egui::Sense::click_and_drag(),
         );
+
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if resp.double_clicked() {
+            self.actions.toggle_max = true;
+        }
+
         let is_fav_now = self.current_path()
             .map(|p| self.favorites.contains(&p))
             .unwrap_or(false);
@@ -495,20 +512,6 @@ impl SnapView {
             if ui.button("Toggle maximize  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
         });
-    }
-
-    fn handle_window_drag(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let resp = ui.interact(
-            ui.available_rect_before_wrap(),
-            egui::Id::new("drag_zone"),
-            egui::Sense::click_and_drag(),
-        );
-        if resp.drag_started_by(egui::PointerButton::Primary) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-        if resp.double_clicked() {
-            self.actions.toggle_max = true;
-        }
     }
 
     fn handle_drop(&mut self, ctx: &egui::Context) {
@@ -610,7 +613,9 @@ fn is_image(p: &Path) -> bool {
 
 fn decode_image(path: &Path) -> LoadedImage {
     match image::open(path) {
-        Ok(img) => {
+        Ok(mut img) => {
+            let orient = read_exif_orientation(path).unwrap_or(1);
+            img = apply_exif_orientation(img, orient);
             let rgba = img.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let pixels = rgba.into_raw();
@@ -619,6 +624,45 @@ fn decode_image(path: &Path) -> LoadedImage {
         }
         Err(_) => LoadedImage::Failed,
     }
+}
+
+fn read_exif_orientation(path: &Path) -> Option<u32> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+    let field = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?;
+    field.value.get_uint(0)
+}
+
+fn apply_exif_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
+    use image::DynamicImage;
+    match orientation {
+        2 => DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&img)),
+        3 => img.rotate180(),
+        4 => DynamicImage::ImageRgba8(image::imageops::flip_vertical(&img)),
+        5 => {
+            let r = img.rotate90();
+            DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&r))
+        }
+        6 => img.rotate90(),
+        7 => {
+            let r = img.rotate270();
+            DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&r))
+        }
+        8 => img.rotate270(),
+        _ => img,
+    }
+}
+
+fn load_app_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../assets/icon.png");
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width: w,
+        height: h,
+    })
 }
 
 fn favorites_path(folder: &Path) -> PathBuf {
