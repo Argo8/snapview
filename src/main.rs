@@ -107,6 +107,7 @@ struct SnapView {
 
     thumb_cache: Arc<Mutex<HashMap<PathBuf, LoadedImage>>>,
     thumb_textures: HashMap<PathBuf, egui::TextureHandle>,
+    full_dims: HashMap<PathBuf, [usize; 2]>,
 
     full_tx: mpsc::Sender<PathBuf>,
     thumb_tx: mpsc::Sender<PathBuf>,
@@ -123,11 +124,17 @@ struct SnapView {
 
     pending_delete: Option<PathBuf>,
     last_image_rect: Option<egui::Rect>,
+
+    zoom: f32,
+    target_zoom: f32,
+    pan: egui::Vec2,
+    target_pan: egui::Vec2,
+    last_view_path: Option<PathBuf>,
 }
 
 enum JobResult {
     Full(PathBuf, LoadedImage),
-    Thumb(PathBuf, LoadedImage),
+    Thumb(PathBuf, LoadedImage, Option<[usize; 2]>),
 }
 
 impl SnapView {
@@ -165,8 +172,8 @@ impl SnapView {
                     let lock = rx.lock().unwrap();
                     match lock.recv() { Ok(p) => p, Err(_) => break }
                 };
-                let r = decode_thumb(&path);
-                let _ = tx.send(JobResult::Thumb(path, r));
+                let (r, dims) = decode_thumb(&path);
+                let _ = tx.send(JobResult::Thumb(path, r, dims));
                 ctx.request_repaint();
             });
         }
@@ -182,6 +189,7 @@ impl SnapView {
             sidecars: HashMap::new(),
             thumb_cache: Arc::new(Mutex::new(HashMap::new())),
             thumb_textures: HashMap::new(),
+            full_dims: HashMap::new(),
             full_tx,
             thumb_tx,
             result_rx,
@@ -193,6 +201,11 @@ impl SnapView {
             filter_msg: None,
             pending_delete: None,
             last_image_rect: None,
+            zoom: 1.0,
+            target_zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            target_pan: egui::Vec2::ZERO,
+            last_view_path: None,
         };
 
         if let Some(p) = initial_path {
@@ -245,6 +258,7 @@ impl SnapView {
         self.thumb_cache.lock().unwrap().clear();
         self.textures.clear();
         self.thumb_textures.clear();
+        self.full_dims.clear();
         self.rotation.clear();
 
         // Queue thumbnails for every image, in order from current outward so visible region loads first
@@ -322,10 +336,11 @@ impl SnapView {
                         }
                     }
                 }
-                JobResult::Thumb(path, result) => {
+                JobResult::Thumb(path, result, dims) => {
                     let mut tc = self.thumb_cache.lock().unwrap();
                     tc.insert(path.clone(), result.clone());
                     drop(tc);
+                    if let Some(d) = dims { self.full_dims.insert(path.clone(), d); }
                     if let LoadedImage::Ready(ci) = result {
                         let tex = ctx.load_texture(
                             format!("thumb:{}", path.to_string_lossy()),
@@ -540,6 +555,42 @@ impl SnapView {
         self.images.get(self.current).cloned()
     }
 
+    fn reset_view(&mut self) {
+        self.zoom = 1.0;
+        self.target_zoom = 1.0;
+        self.pan = egui::Vec2::ZERO;
+        self.target_pan = egui::Vec2::ZERO;
+    }
+
+    fn apply_zoom(&mut self, factor: f32, hover: Option<egui::Pos2>, ctx: &egui::Context) {
+        let new_target = (self.target_zoom * factor).clamp(1.0, 32.0);
+        if (new_target - self.target_zoom).abs() < 0.0001 { return; }
+        let k = new_target / self.target_zoom;
+        let center = ctx.screen_rect().center();
+        let s = hover.unwrap_or(center);
+        self.target_pan = (s - center) * (1.0 - k) + self.target_pan * k;
+        self.target_zoom = new_target;
+        if self.target_zoom <= 1.0001 {
+            self.target_pan = egui::Vec2::ZERO;
+        }
+        ctx.request_repaint();
+    }
+
+    fn animate_view(&mut self, dt: f32) -> bool {
+        let zoom_diff = self.target_zoom - self.zoom;
+        let pan_diff = self.target_pan - self.pan;
+        let any = zoom_diff.abs() > 0.0005 || pan_diff.length() > 0.05;
+        if !any {
+            self.zoom = self.target_zoom;
+            self.pan = self.target_pan;
+            return false;
+        }
+        let t = (dt * 22.0).clamp(0.0, 1.0);
+        self.zoom += zoom_diff * t;
+        self.pan += pan_diff * t;
+        true
+    }
+
     fn current_is_portrait(&self) -> bool {
         let path = match self.current_path() { Some(p) => p, None => return false };
         let cache = self.cache.lock().unwrap();
@@ -582,6 +633,16 @@ impl eframe::App for SnapView {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_results(ctx);
 
+        // Reset view when current image changes
+        let cur_path = self.current_path();
+        if cur_path != self.last_view_path {
+            self.reset_view();
+            self.last_view_path = cur_path;
+        }
+
+        let dt = ctx.input(|i| i.unstable_dt);
+        if self.animate_view(dt) { ctx.request_repaint(); }
+
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
 
         let modal_open = self.pending_delete.is_some();
@@ -615,15 +676,25 @@ impl eframe::App for SnapView {
             }
         });
 
-        // Mouse wheel navigation
-        let scroll = ctx.input(|i| i.raw_scroll_delta.y);
-        if scroll.abs() > 1.0 && !self.show_filter && !modal_open {
-            if scroll < 0.0 { self.actions.next = true; }
-            else { self.actions.prev = true; }
+        // Scroll / pinch -> zoom (cursor-anchored)
+        if !self.show_filter && !modal_open {
+            let (scroll_y, zoom_pinch, hover) = ctx.input(|i| {
+                (i.raw_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos())
+            });
+            let mut factor = 1.0_f32;
+            if scroll_y.abs() > 0.5 { factor *= (scroll_y * 0.0018).exp(); }
+            if (zoom_pinch - 1.0).abs() > 0.0005 { factor *= zoom_pinch; }
+            if (factor - 1.0).abs() > 0.0001 {
+                self.apply_zoom(factor, hover, ctx);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Num0)) {
+                self.target_zoom = 1.0;
+                self.target_pan = egui::Vec2::ZERO;
+            }
         }
 
         let portrait = self.current_is_portrait();
-        let suppress_dim = portrait && !self.is_fullscreen;
+        let suppress_dim = portrait && !self.is_fullscreen && self.target_zoom <= 1.001;
         let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
@@ -703,21 +774,29 @@ impl SnapView {
 
         let rotation_quarter = *self.rotation.get(&path).unwrap_or(&0);
 
-        let tex_opt = self.textures.get(&path).cloned()
-            .or_else(|| self.thumb_textures.get(&path).cloned());
+        let full_tex = self.textures.get(&path).cloned();
+        let tex_opt = full_tex.clone().or_else(|| self.thumb_textures.get(&path).cloned());
 
         if let Some(tex) = tex_opt {
-            let img_size = tex.size_vec2();
+            // Prefer full texture's own size; otherwise use stored full dims; finally fall back to texture size.
+            let img_size = if let Some(t) = &full_tex {
+                t.size_vec2()
+            } else if let Some(d) = self.full_dims.get(&path) {
+                egui::vec2(d[0] as f32, d[1] as f32)
+            } else {
+                tex.size_vec2()
+            };
             let (fit_w, fit_h) = if rotation_quarter % 2 == 0 {
                 (img_size.x, img_size.y)
             } else {
                 (img_size.y, img_size.x)
             };
-            let scale = (avail.x / fit_w).min(avail.y / fit_h).min(1.0).max(0.01);
+            let base_scale = (avail.x / fit_w).min(avail.y / fit_h).min(1.0).max(0.01);
+            let scale = base_scale * self.zoom;
             let draw_w = img_size.x * scale;
             let draw_h = img_size.y * scale;
 
-            let center = ui.available_rect_before_wrap().center();
+            let center = ui.available_rect_before_wrap().center() + self.pan;
             let angle = rotation_quarter as f32 * std::f32::consts::FRAC_PI_2;
 
             let mut mesh = egui::Mesh::with_texture(tex.id());
@@ -816,11 +895,23 @@ impl SnapView {
             egui::Sense::click_and_drag(),
         );
 
-        if resp.drag_started_by(egui::PointerButton::Primary) {
+        let zoomed = self.target_zoom > 1.001;
+        if zoomed {
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                let d = resp.drag_delta();
+                self.pan += d;
+                self.target_pan += d;
+            }
+        } else if resp.drag_started_by(egui::PointerButton::Primary) {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
         if resp.double_clicked() {
-            self.actions.toggle_max = true;
+            if zoomed {
+                self.target_zoom = 1.0;
+                self.target_pan = egui::Vec2::ZERO;
+            } else {
+                self.actions.toggle_max = true;
+            }
         }
 
         let is_fav_now = self.current_path()
@@ -1044,19 +1135,20 @@ fn decode_image(path: &Path) -> LoadedImage {
     }
 }
 
-fn decode_thumb(path: &Path) -> LoadedImage {
+fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>) {
     match image::open(path) {
         Ok(mut img) => {
             let orient = read_exif_orientation(path).unwrap_or(1);
             img = apply_exif_orientation(img, orient);
+            let full_dims = [img.width() as usize, img.height() as usize];
             let small = img.thumbnail(THUMB_MAX, THUMB_MAX);
             let rgba = small.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let pixels = rgba.into_raw();
             let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-            LoadedImage::Ready(Arc::new(ci))
+            (LoadedImage::Ready(Arc::new(ci)), Some(full_dims))
         }
-        Err(_) => LoadedImage::Failed,
+        Err(_) => (LoadedImage::Failed, None),
     }
 }
 
