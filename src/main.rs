@@ -831,6 +831,7 @@ impl eframe::App for SnapView {
             self.render_image(ui, ctx);
             self.render_overlay(ui);
             self.handle_background_interaction(ui, ctx);
+            self.render_close_button(ui);
         });
 
         if self.show_filter {
@@ -1014,6 +1015,51 @@ impl SnapView {
                 egui::FontId::proportional(16.0),
                 egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha),
             );
+        }
+    }
+
+    fn render_close_button(&mut self, ui: &mut egui::Ui) {
+        if self.is_maximized { return; }
+        let rect = ui.available_rect_before_wrap();
+        let hover_zone = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 90.0, rect.top()),
+            egui::vec2(90.0, 90.0),
+        );
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let in_zone = pointer.map(|p| hover_zone.contains(p)).unwrap_or(false);
+
+        let size = 22.0;
+        let btn_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - size - 14.0, rect.top() + 14.0),
+            egui::vec2(size, size),
+        );
+        let resp = ui.interact(btn_rect, egui::Id::new("close_btn"), egui::Sense::click());
+        if !in_zone && !resp.hovered() { return; }
+
+        let color = if resp.hovered() {
+            egui::Color32::from_rgb(255, 90, 90)
+        } else {
+            egui::Color32::from_rgba_premultiplied(230, 230, 230, 220)
+        };
+        let stroke = egui::Stroke::new(2.5, color);
+        let pad = 5.0;
+        let painter = ui.painter();
+        painter.line_segment(
+            [
+                egui::pos2(btn_rect.left() + pad, btn_rect.top() + pad),
+                egui::pos2(btn_rect.right() - pad, btn_rect.bottom() - pad),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(btn_rect.right() - pad, btn_rect.top() + pad),
+                egui::pos2(btn_rect.left() + pad, btn_rect.bottom() - pad),
+            ],
+            stroke,
+        );
+        if resp.clicked() {
+            self.actions.quit = true;
         }
     }
 
