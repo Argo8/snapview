@@ -509,7 +509,10 @@ impl eframe::App for SnapView {
                     else { self.actions.cycle_filter = true; }
                 }
                 if i.key_pressed(egui::Key::Delete) { self.actions.delete = true; }
-                if i.key_pressed(egui::Key::Escape) { self.actions.quit = true; }
+                if i.key_pressed(egui::Key::Escape) {
+                    if self.is_maximized { self.actions.toggle_max = true; }
+                    else { self.actions.quit = true; }
+                }
                 if i.key_pressed(egui::Key::O) && i.modifiers.ctrl { self.actions.open_folder = true; }
                 if i.key_pressed(egui::Key::F11) { self.actions.toggle_max = true; }
                 if i.key_pressed(egui::Key::Enter) && i.modifiers.alt { self.actions.toggle_max = true; }
