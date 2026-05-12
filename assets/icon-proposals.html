@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<title>snapview — icon proposals</title>
+<style>
+  :root {
+    --bg: #0d0d0f;
+    --panel: #15161a;
+    --line: #232428;
+    --text: #e8e8ec;
+    --muted: #8a8b92;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  h1 { font-weight: 600; letter-spacing: -0.02em; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin-bottom: 32px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 18px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px;
+    display: flex; flex-direction: column; align-items: center;
+    gap: 14px;
+  }
+  .icon-row {
+    display: flex; align-items: center; gap: 18px;
+  }
+  .icon-128 { width: 96px; height: 96px; }
+  .icon-32 { width: 32px; height: 32px; }
+  .icon-16 { width: 16px; height: 16px; }
+  .name { font-weight: 600; font-size: 14px; text-align: center; }
+  .desc { font-size: 12px; color: var(--muted); text-align: center; min-height: 32px; }
+  .num { color: var(--muted); font-size: 11px; letter-spacing: 0.1em; }
+  .checker {
+    background-image:
+      linear-gradient(45deg, #2a2b30 25%, transparent 25%),
+      linear-gradient(-45deg, #2a2b30 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #2a2b30 75%),
+      linear-gradient(-45deg, transparent 75%, #2a2b30 75%);
+    background-size: 12px 12px;
+    background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+    border-radius: 8px;
+    padding: 6px;
+  }
+</style>
+</head>
+<body>
+<h1>snapview — icon proposals</h1>
+<div class="sub">Svaka opcija prikazana na 96 px, 32 px i 16 px (taskbar). Odaberi broj.</div>
+
+<div class="grid">
+
+<!-- 1: Minimalist aperture -->
+<div class="card">
+  <div class="num">01</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#4aa8ff"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g1)"/><g transform="translate(64 64)" fill="none" stroke="#fff" stroke-width="6" stroke-linejoin="round"><circle r="34"/><g><polygon points="0,-34 29,-17 0,0"/><polygon points="29,-17 29,17 0,0"/><polygon points="29,17 0,34 0,0"/><polygon points="0,34 -29,17 0,0"/><polygon points="-29,17 -29,-17 0,0"/><polygon points="-29,-17 0,-34 0,0"/></g></g></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g1)"/><g transform="translate(64 64)" fill="none" stroke="#fff" stroke-width="6"><circle r="34"/></g></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g1)"/><circle cx="64" cy="64" r="34" fill="none" stroke="#fff" stroke-width="10"/></svg></div>
+  </div>
+  <div class="name">Aperture (zaslonska blažda)</div>
+  <div class="desc">Klasično foto, gradijent plavo→ljubičasto.</div>
+</div>
+
+<!-- 2: S monogram -->
+<div class="card">
+  <div class="num">02</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff6b9d"/><stop offset="1" stop-color="#ff5e3a"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g2)"/><text x="64" y="92" font-family="Inter, system-ui" font-weight="800" font-size="88" text-anchor="middle" fill="#fff" letter-spacing="-2">S</text></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g2)"/><text x="64" y="92" font-family="Inter, system-ui" font-weight="800" font-size="88" text-anchor="middle" fill="#fff">S</text></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g2)"/><text x="64" y="96" font-family="Inter, system-ui" font-weight="900" font-size="100" text-anchor="middle" fill="#fff">S</text></svg></div>
+  </div>
+  <div class="name">S monogram</div>
+  <div class="desc">Bold S, korale gradient.</div>
+</div>
+
+<!-- 3: Polaroid stack -->
+<div class="card">
+  <div class="num">03</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2a2d36"/><stop offset="1" stop-color="#14161c"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g3)"/><g transform="translate(64 64)"><g transform="rotate(-15)"><rect x="-30" y="-34" width="60" height="68" rx="3" fill="#fff"/><rect x="-26" y="-30" width="52" height="48" fill="#7c5cff"/></g><g transform="rotate(8) translate(8 -2)"><rect x="-30" y="-34" width="60" height="68" rx="3" fill="#fff"/><rect x="-26" y="-30" width="52" height="48" fill="#ff5e3a"/></g><g transform="rotate(-2) translate(18 4)"><rect x="-30" y="-34" width="60" height="68" rx="3" fill="#fff"/><rect x="-26" y="-30" width="52" height="48" fill="#4aa8ff"/></g></g></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g3)"/><g transform="translate(64 64)"><g transform="rotate(-15)"><rect x="-34" y="-38" width="68" height="76" rx="4" fill="#fff"/><rect x="-29" y="-33" width="58" height="54" fill="#7c5cff"/></g></g></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g3)"/><rect x="22" y="24" width="84" height="80" rx="6" fill="#fff"/><rect x="30" y="32" width="68" height="58" fill="#7c5cff"/></svg></div>
+  </div>
+  <div class="name">Polaroid stack</div>
+  <div class="desc">Tri preklopljena framea, tamna pozadina.</div>
+</div>
+
+<!-- 4: Shutter eye -->
+<div class="card">
+  <div class="num">04</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g4" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#00d4ff"/><stop offset="1" stop-color="#0066ff"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="#0a0c14"/><circle cx="64" cy="64" r="36" fill="url(#g4)"/><circle cx="64" cy="64" r="14" fill="#0a0c14"/><rect x="20" y="62" width="88" height="4" fill="#0a0c14"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#0a0c14"/><circle cx="64" cy="64" r="36" fill="url(#g4)"/><circle cx="64" cy="64" r="14" fill="#0a0c14"/><rect x="20" y="62" width="88" height="4" fill="#0a0c14"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#0a0c14"/><circle cx="64" cy="64" r="40" fill="url(#g4)"/><circle cx="64" cy="64" r="14" fill="#0a0c14"/></svg></div>
+  </div>
+  <div class="name">Shutter eye</div>
+  <div class="desc">Cyan oko + horizontalni kapci.</div>
+</div>
+
+<!-- 5: Mountain peak -->
+<div class="card">
+  <div class="num">05</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g5" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd86b"/><stop offset="1" stop-color="#ff8a3d"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g5)"/><circle cx="92" cy="38" r="12" fill="#fff"/><polygon points="18,98 50,52 72,82 88,64 110,98" fill="#1a1a22"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g5)"/><circle cx="92" cy="38" r="12" fill="#fff"/><polygon points="18,98 50,52 72,82 88,64 110,98" fill="#1a1a22"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g5)"/><circle cx="94" cy="36" r="16" fill="#fff"/><polygon points="14,102 50,46 72,82 90,60 114,102" fill="#1a1a22"/></svg></div>
+  </div>
+  <div class="name">Mountain &amp; sun</div>
+  <div class="desc">Foto pejzaž motiv, topli tonovi.</div>
+</div>
+
+<!-- 6: Lens stack -->
+<div class="card">
+  <div class="num">06</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><radialGradient id="g6" cx="0.35" cy="0.35"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="0.5" stop-color="#3a86ff" stop-opacity="0.9"/><stop offset="1" stop-color="#0c1a3a"/></radialGradient></defs><rect width="128" height="128" rx="26" fill="#0c1a3a"/><circle cx="64" cy="64" r="44" fill="url(#g6)"/><circle cx="64" cy="64" r="44" fill="none" stroke="#1a2a55" stroke-width="3"/><circle cx="64" cy="64" r="28" fill="none" stroke="#1a2a55" stroke-width="2"/><circle cx="50" cy="50" r="8" fill="#fff" fill-opacity="0.6"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#0c1a3a"/><circle cx="64" cy="64" r="44" fill="url(#g6)"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#0c1a3a"/><circle cx="64" cy="64" r="50" fill="url(#g6)"/></svg></div>
+  </div>
+  <div class="name">Camera lens</div>
+  <div class="desc">Realistični objektiv s refleksom.</div>
+</div>
+
+<!-- 7: Pixel grid -->
+<div class="card">
+  <div class="num">07</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#fafafa"/><g><rect x="24" y="24" width="22" height="22" fill="#ff5e3a"/><rect x="50" y="24" width="22" height="22" fill="#ffd86b"/><rect x="76" y="24" width="22" height="22" fill="#4aa8ff"/><rect x="24" y="50" width="22" height="22" fill="#7c5cff"/><rect x="50" y="50" width="22" height="22" fill="#1a1a22"/><rect x="76" y="50" width="22" height="22" fill="#3ddc97"/><rect x="24" y="76" width="22" height="22" fill="#ff8a3d"/><rect x="50" y="76" width="22" height="22" fill="#4aa8ff"/><rect x="76" y="76" width="22" height="22" fill="#ff5e3a"/></g></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#fafafa"/><rect x="24" y="24" width="22" height="22" fill="#ff5e3a"/><rect x="50" y="24" width="22" height="22" fill="#ffd86b"/><rect x="76" y="24" width="22" height="22" fill="#4aa8ff"/><rect x="24" y="50" width="22" height="22" fill="#7c5cff"/><rect x="50" y="50" width="22" height="22" fill="#1a1a22"/><rect x="76" y="50" width="22" height="22" fill="#3ddc97"/><rect x="24" y="76" width="22" height="22" fill="#ff8a3d"/><rect x="50" y="76" width="22" height="22" fill="#4aa8ff"/><rect x="76" y="76" width="22" height="22" fill="#ff5e3a"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#fafafa"/><rect x="14" y="14" width="32" height="32" fill="#ff5e3a"/><rect x="48" y="14" width="32" height="32" fill="#ffd86b"/><rect x="82" y="14" width="32" height="32" fill="#4aa8ff"/><rect x="14" y="48" width="32" height="32" fill="#7c5cff"/><rect x="48" y="48" width="32" height="32" fill="#1a1a22"/><rect x="82" y="48" width="32" height="32" fill="#3ddc97"/><rect x="14" y="82" width="32" height="32" fill="#ff8a3d"/><rect x="48" y="82" width="32" height="32" fill="#4aa8ff"/><rect x="82" y="82" width="32" height="32" fill="#ff5e3a"/></svg></div>
+  </div>
+  <div class="name">Pixel grid</div>
+  <div class="desc">9-piksel mozaik, foto-paleta.</div>
+</div>
+
+<!-- 8: Folded photo corner -->
+<div class="card">
+  <div class="num">08</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g8" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3ddc97"/><stop offset="1" stop-color="#0a8c5a"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g8)"/><g transform="translate(64 64)"><path d="M -32 -36 L 24 -36 L 36 -24 L 36 36 L -32 36 Z" fill="#fff"/><path d="M 24 -36 L 36 -24 L 24 -24 Z" fill="#cfeedd"/><circle cx="-12" cy="-10" r="6" fill="#ffd86b"/><polyline points="-32,28 -8,4 8,18 30,-4" fill="none" stroke="#0a8c5a" stroke-width="3" stroke-linejoin="round"/></g></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g8)"/><g transform="translate(64 64)"><path d="M -32 -36 L 24 -36 L 36 -24 L 36 36 L -32 36 Z" fill="#fff"/><circle cx="-12" cy="-10" r="6" fill="#ffd86b"/><polyline points="-32,28 -8,4 8,18 30,-4" fill="none" stroke="#0a8c5a" stroke-width="3"/></g></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g8)"/><path d="M 28 24 L 92 24 L 108 40 L 108 104 L 28 104 Z" fill="#fff"/></svg></div>
+  </div>
+  <div class="name">Photo with fold</div>
+  <div class="desc">Klasična foto-ikona s pejzažom.</div>
+</div>
+
+<!-- 9: Geometric V -->
+<div class="card">
+  <div class="num">09</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g9" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1a1a22"/><stop offset="1" stop-color="#3a3a48"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g9)"/><polygon points="28,32 50,32 64,80 78,32 100,32 72,100 56,100" fill="#fff"/><circle cx="64" cy="72" r="4" fill="#ff5e3a"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g9)"/><polygon points="28,32 50,32 64,80 78,32 100,32 72,100 56,100" fill="#fff"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g9)"/><polygon points="20,28 46,28 64,84 82,28 108,28 76,104 52,104" fill="#fff"/></svg></div>
+  </div>
+  <div class="name">V monogram</div>
+  <div class="desc">Geometrijsko V, tamna pozadina, akcent.</div>
+</div>
+
+<!-- 10: Eye + image -->
+<div class="card">
+  <div class="num">10</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g10" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9c27ff"/><stop offset="1" stop-color="#ff2d92"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g10)"/><path d="M 18 64 Q 64 22 110 64 Q 64 106 18 64 Z" fill="#fff"/><circle cx="64" cy="64" r="20" fill="#1a1a22"/><circle cx="58" cy="58" r="6" fill="#fff"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g10)"/><path d="M 18 64 Q 64 22 110 64 Q 64 106 18 64 Z" fill="#fff"/><circle cx="64" cy="64" r="20" fill="#1a1a22"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g10)"/><path d="M 12 64 Q 64 16 116 64 Q 64 112 12 64 Z" fill="#fff"/><circle cx="64" cy="64" r="24" fill="#1a1a22"/></svg></div>
+  </div>
+  <div class="name">Eye / viewer</div>
+  <div class="desc">Doslovno "view", magenta gradijent.</div>
+</div>
+
+<!-- 11: Glass card -->
+<div class="card">
+  <div class="num">11</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g11bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff5e9c"/><stop offset="0.5" stop-color="#7c5cff"/><stop offset="1" stop-color="#4aa8ff"/></linearGradient><linearGradient id="g11gl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.6"/><stop offset="1" stop-color="#fff" stop-opacity="0.15"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g11bg)"/><rect x="26" y="32" width="76" height="64" rx="10" fill="url(#g11gl)" stroke="#fff" stroke-opacity="0.7" stroke-width="1.5"/><circle cx="44" cy="50" r="6" fill="#fff" fill-opacity="0.9"/><polyline points="26,86 50,68 68,80 102,52" stroke="#fff" stroke-width="3" fill="none" stroke-linejoin="round"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g11bg)"/><rect x="26" y="32" width="76" height="64" rx="10" fill="url(#g11gl)" stroke="#fff" stroke-opacity="0.7" stroke-width="2"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g11bg)"/><rect x="20" y="30" width="88" height="68" rx="12" fill="#fff" fill-opacity="0.5"/></svg></div>
+  </div>
+  <div class="name">Glassmorphism</div>
+  <div class="desc">Frosted glass card iznad gradijenta.</div>
+</div>
+
+<!-- 12: Minimal frame -->
+<div class="card">
+  <div class="num">12</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#fafafa"/><rect x="22" y="22" width="84" height="84" rx="8" fill="none" stroke="#1a1a22" stroke-width="6"/><circle cx="46" cy="46" r="8" fill="#ff5e3a"/><polyline points="22,92 52,62 72,80 106,46" stroke="#1a1a22" stroke-width="6" fill="none" stroke-linejoin="round"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#fafafa"/><rect x="22" y="22" width="84" height="84" rx="8" fill="none" stroke="#1a1a22" stroke-width="8"/><circle cx="46" cy="46" r="10" fill="#ff5e3a"/><polyline points="22,92 52,62 72,80 106,46" stroke="#1a1a22" stroke-width="8" fill="none"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#fafafa"/><rect x="18" y="18" width="92" height="92" rx="10" fill="none" stroke="#1a1a22" stroke-width="14"/></svg></div>
+  </div>
+  <div class="name">Minimal line photo</div>
+  <div class="desc">Crno-bijelo, jasno na 16 px.</div>
+</div>
+
+<!-- 13: Neon -->
+<div class="card">
+  <div class="num">13</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><filter id="glow"><feGaussianBlur stdDeviation="2"/></filter></defs><rect width="128" height="128" rx="26" fill="#0a0a14"/><circle cx="64" cy="64" r="32" fill="none" stroke="#00ffea" stroke-width="3" filter="url(#glow)"/><circle cx="64" cy="64" r="32" fill="none" stroke="#00ffea" stroke-width="1.5"/><circle cx="64" cy="64" r="12" fill="#ff00aa" filter="url(#glow)"/><circle cx="64" cy="64" r="12" fill="#ff00aa"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#0a0a14"/><circle cx="64" cy="64" r="32" fill="none" stroke="#00ffea" stroke-width="4"/><circle cx="64" cy="64" r="12" fill="#ff00aa"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#0a0a14"/><circle cx="64" cy="64" r="36" fill="none" stroke="#00ffea" stroke-width="10"/><circle cx="64" cy="64" r="16" fill="#ff00aa"/></svg></div>
+  </div>
+  <div class="name">Neon lens</div>
+  <div class="desc">Cyberpunk vibe, glow akcenti.</div>
+</div>
+
+<!-- 14: Origami -->
+<div class="card">
+  <div class="num">14</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g14" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff5e6"/><stop offset="1" stop-color="#f4e0c0"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g14)"/><polygon points="64,18 110,64 64,110 18,64" fill="#ff5e3a"/><polygon points="64,18 110,64 64,64" fill="#ff8a3d" fill-opacity="0.7"/><polygon points="64,110 18,64 64,64" fill="#c43a1a" fill-opacity="0.7"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g14)"/><polygon points="64,18 110,64 64,110 18,64" fill="#ff5e3a"/><polygon points="64,18 110,64 64,64" fill="#ff8a3d"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g14)"/><polygon points="64,10 118,64 64,118 10,64" fill="#ff5e3a"/></svg></div>
+  </div>
+  <div class="name">Origami diamond</div>
+  <div class="desc">Geometrijski origami, topli papir.</div>
+</div>
+
+<!-- 15: Spectrum -->
+<div class="card">
+  <div class="num">15</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g15" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ff3b3b"/><stop offset="0.2" stop-color="#ff9f1c"/><stop offset="0.4" stop-color="#ffd60a"/><stop offset="0.6" stop-color="#3ddc97"/><stop offset="0.8" stop-color="#4aa8ff"/><stop offset="1" stop-color="#9c27ff"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="#0d0d0f"/><circle cx="64" cy="64" r="40" fill="url(#g15)"/><circle cx="64" cy="64" r="16" fill="#0d0d0f"/></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#0d0d0f"/><circle cx="64" cy="64" r="40" fill="url(#g15)"/><circle cx="64" cy="64" r="16" fill="#0d0d0f"/></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="#0d0d0f"/><circle cx="64" cy="64" r="48" fill="url(#g15)"/><circle cx="64" cy="64" r="18" fill="#0d0d0f"/></svg></div>
+  </div>
+  <div class="name">Spectrum ring</div>
+  <div class="desc">Boja spektar prsten na tamnom.</div>
+</div>
+
+<!-- 16: SV ligature -->
+<div class="card">
+  <div class="num">16</div>
+  <div class="icon-row">
+    <div class="checker"><svg class="icon-128" viewBox="0 0 128 128"><defs><linearGradient id="g16" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4aa8ff"/><stop offset="1" stop-color="#9c27ff"/></linearGradient></defs><rect width="128" height="128" rx="26" fill="url(#g16)"/><text x="64" y="86" font-family="Inter, system-ui" font-weight="800" font-size="48" text-anchor="middle" fill="#fff" letter-spacing="-2">sv</text></svg></div>
+    <div class="checker"><svg class="icon-32" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g16)"/><text x="64" y="86" font-family="Inter, system-ui" font-weight="800" font-size="48" text-anchor="middle" fill="#fff">sv</text></svg></div>
+    <div class="checker"><svg class="icon-16" viewBox="0 0 128 128"><rect width="128" height="128" rx="26" fill="url(#g16)"/><text x="64" y="92" font-family="Inter, system-ui" font-weight="900" font-size="68" text-anchor="middle" fill="#fff">sv</text></svg></div>
+  </div>
+  <div class="name">sv ligature</div>
+  <div class="desc">Mali "sv" lowercase, plavo-ljubičasti gradijent.</div>
+</div>
+
+</div>
+
+<p style="margin-top:40px; color:var(--muted); font-size:13px">
+Odaberi broj (npr. "01" ili "Aperture") i ja generiram .ico + .png u toj raster verziji za buildanje.
+</p>
+</body>
+</html>

@@ -67,6 +67,7 @@ struct PendingActions {
     delete: bool,
     confirm_delete: bool,
     cancel_delete: bool,
+    show_about: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,6 +114,7 @@ struct SnapView {
     result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
+    show_about: bool,
     filter_selected: HashSet<PathBuf>,
 
     is_fullscreen: bool,
@@ -260,6 +262,7 @@ impl SnapView {
             thumb_q,
             result_rx,
             show_filter: false,
+            show_about: false,
             filter_selected: HashSet::new(),
             is_fullscreen: false,
             actions: PendingActions::default(),
@@ -855,6 +858,10 @@ impl eframe::App for SnapView {
             self.render_delete_confirm(ctx);
         }
 
+        if self.show_about {
+            self.render_about(ctx);
+        }
+
         // Apply queued actions
         let actions = std::mem::take(&mut self.actions);
         if actions.next { self.next(); }
@@ -882,6 +889,7 @@ impl eframe::App for SnapView {
         if actions.delete { self.request_delete(); }
         if actions.confirm_delete { self.confirm_delete(); }
         if actions.cancel_delete { self.pending_delete = None; }
+        if actions.show_about { self.show_about = true; }
 
         // Decay transient filter message
         if let Some((_, ref mut t)) = self.filter_msg {
@@ -1210,6 +1218,8 @@ impl SnapView {
             if ui.button("Move to trash  (Delete)").clicked() { self.actions.delete = true; ui.close_menu(); }
             ui.separator();
             if ui.button("Toggle fullscreen  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
+            ui.separator();
+            if ui.button("About snapview…").clicked() { self.actions.show_about = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
         });
     }
@@ -1289,6 +1299,48 @@ impl SnapView {
 
         if do_confirm { self.actions.confirm_delete = true; }
         if do_cancel { self.actions.cancel_delete = true; }
+    }
+
+    fn render_about(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("about_dim"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    egui::Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                );
+                ui.allocate_rect(screen, egui::Sense::click());
+            });
+
+        let mut close = false;
+        egui::Window::new("About snapview")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("snapview").size(22.0).strong());
+                    ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .color(egui::Color32::from_gray(180)));
+                    ui.add_space(10.0);
+                    ui.label("Fast, minimal image viewer");
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("by Filip Kozina")
+                        .color(egui::Color32::from_gray(200)));
+                    ui.add_space(14.0);
+                    if ui.button("Close").clicked() { close = true; }
+                });
+                ui.add_space(4.0);
+            });
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_about = false;
+        }
     }
 
     fn render_filter_window(&mut self, ctx: &egui::Context) {
