@@ -414,12 +414,23 @@ impl SnapView {
                     cache.insert(path.clone(), result.clone());
                     drop(cache);
                     if let LoadedImage::Ready(ci) = result {
-                        let tex = ctx.load_texture(
-                            path.to_string_lossy().to_string(),
-                            (*ci).clone(),
-                            egui::TextureOptions::LINEAR,
-                        );
-                        self.textures.insert(path, tex);
+                        // Skip GPU upload for results that have drifted far from
+                        // current — keep in cache (cheap), upload only if/when
+                        // the user navigates back.
+                        let upload = self
+                            .images
+                            .iter()
+                            .position(|p| p == &path)
+                            .map(|i| (i as isize - self.current as isize).unsigned_abs() <= TEXTURE_CACHE_MAX / 2)
+                            .unwrap_or(true);
+                        if upload {
+                            let tex = ctx.load_texture(
+                                path.to_string_lossy().to_string(),
+                                (*ci).clone(),
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.textures.insert(path, tex);
+                        }
                     }
                 }
                 JobResult::Thumb(path, result, dims) => {
@@ -1038,7 +1049,7 @@ impl SnapView {
 
     fn render_close_button(&mut self, ui: &mut egui::Ui) {
         if self.is_fullscreen { return; }
-        let rect = ui.available_rect_before_wrap();
+        let rect = self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
         let hover_zone = egui::Rect::from_min_size(
             egui::pos2(rect.right() - 90.0, rect.top()),
             egui::vec2(90.0, 90.0),
@@ -1083,7 +1094,7 @@ impl SnapView {
 
     fn render_nav_chevrons(&mut self, ui: &mut egui::Ui) {
         if self.images.is_empty() { return; }
-        let rect = ui.available_rect_before_wrap();
+        let rect = self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let zone_w = 110.0;
         let btn_w = 36.0;
@@ -1483,40 +1494,93 @@ fn is_raw_sidecar(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn decode_image(path: &Path) -> LoadedImage {
-    match image::open(path) {
-        Ok(mut img) => {
-            let orient = read_exif_orientation(path).unwrap_or(1);
-            img = apply_exif_orientation(img, orient);
-            let max_dim = img.width().max(img.height());
-            if max_dim > FULL_MAX_DIM {
-                img = img.resize(FULL_MAX_DIM, FULL_MAX_DIM, image::imageops::FilterType::Triangle);
-            }
-            let rgba = img.to_rgba8();
-            let size = [rgba.width() as usize, rgba.height() as usize];
-            let pixels = rgba.into_raw();
-            let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-            LoadedImage::Ready(Arc::new(ci))
-        }
-        Err(_) => LoadedImage::Failed,
+fn is_jpeg(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("jpeg"))
+        .unwrap_or(false)
+}
+
+fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::DynamicImage> {
+    let f = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(f);
+    let mut decoder = jpeg_decoder::Decoder::new(reader);
+    decoder.read_info().ok()?;
+    let info = decoder.info()?;
+    let orig_max = info.width.max(info.height) as u32;
+    let denom: u8 = if target_max_dim == 0 || orig_max == 0 {
+        1
+    } else {
+        let ratio = orig_max / target_max_dim.max(1);
+        if ratio >= 8 { 8 } else if ratio >= 4 { 4 } else if ratio >= 2 { 2 } else { 1 }
+    };
+    if denom != 1 {
+        let _ = decoder.scale(
+            (info.width as u32 / denom as u32).max(1) as u16,
+            (info.height as u32 / denom as u32).max(1) as u16,
+        );
     }
+    let pixels = decoder.decode().ok()?;
+    let info = decoder.info()?;
+    let w = info.width as u32;
+    let h = info.height as u32;
+    let rgba: Vec<u8> = match info.pixel_format {
+        jpeg_decoder::PixelFormat::RGB24 => {
+            let mut out = Vec::with_capacity((w * h * 4) as usize);
+            for c in pixels.chunks_exact(3) {
+                out.extend_from_slice(&[c[0], c[1], c[2], 255]);
+            }
+            out
+        }
+        jpeg_decoder::PixelFormat::L8 => {
+            let mut out = Vec::with_capacity((w * h * 4) as usize);
+            for &v in &pixels {
+                out.extend_from_slice(&[v, v, v, 255]);
+            }
+            out
+        }
+        _ => return None,
+    };
+    let rgba_img = image::RgbaImage::from_raw(w, h, rgba)?;
+    Some(image::DynamicImage::ImageRgba8(rgba_img))
+}
+
+fn decode_image(path: &Path) -> LoadedImage {
+    let img = if is_jpeg(path) {
+        decode_jpeg_scaled(path, FULL_MAX_DIM).or_else(|| image::open(path).ok())
+    } else {
+        image::open(path).ok()
+    };
+    let Some(mut img) = img else { return LoadedImage::Failed };
+    let orient = read_exif_orientation(path).unwrap_or(1);
+    img = apply_exif_orientation(img, orient);
+    let max_dim = img.width().max(img.height());
+    if max_dim > FULL_MAX_DIM {
+        img = img.resize(FULL_MAX_DIM, FULL_MAX_DIM, image::imageops::FilterType::Triangle);
+    }
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = rgba.into_raw();
+    let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+    LoadedImage::Ready(Arc::new(ci))
 }
 
 fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>) {
-    match image::open(path) {
-        Ok(mut img) => {
-            let orient = read_exif_orientation(path).unwrap_or(1);
-            img = apply_exif_orientation(img, orient);
-            let full_dims = [img.width() as usize, img.height() as usize];
-            let small = img.thumbnail(THUMB_MAX, THUMB_MAX);
-            let rgba = small.to_rgba8();
-            let size = [rgba.width() as usize, rgba.height() as usize];
-            let pixels = rgba.into_raw();
-            let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-            (LoadedImage::Ready(Arc::new(ci)), Some(full_dims))
-        }
-        Err(_) => (LoadedImage::Failed, None),
-    }
+    let img = if is_jpeg(path) {
+        decode_jpeg_scaled(path, THUMB_MAX).or_else(|| image::open(path).ok())
+    } else {
+        image::open(path).ok()
+    };
+    let Some(mut img) = img else { return (LoadedImage::Failed, None) };
+    let orient = read_exif_orientation(path).unwrap_or(1);
+    img = apply_exif_orientation(img, orient);
+    let full_dims = [img.width() as usize, img.height() as usize];
+    let small = img.thumbnail(THUMB_MAX, THUMB_MAX);
+    let rgba = small.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = rgba.into_raw();
+    let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+    (LoadedImage::Ready(Arc::new(ci)), Some(full_dims))
 }
 
 fn read_exif_orientation(path: &Path) -> Option<u32> {
