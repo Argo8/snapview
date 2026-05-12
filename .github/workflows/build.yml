@@ -31,24 +31,68 @@ jobs:
       - name: Build (release)
         run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Rename binary
+      - name: Stage binary
         shell: pwsh
         run: |
-          $src = "target/x86_64-pc-windows-msvc/release/snapview.exe"
-          $dst = "snapview.exe"
-          Copy-Item $src $dst -Force
-          Get-Item $dst | Format-List Name, Length
+          New-Item -ItemType Directory -Force -Path target/release | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/snapview.exe target/release/snapview.exe -Force
+          Copy-Item target/release/snapview.exe snapview.exe -Force
 
-      - name: Upload artifact
+      # Optional code signing — set repo secrets WINDOWS_PFX_BASE64 and WINDOWS_PFX_PASSWORD to enable.
+      - name: Decode signing certificate
+        if: ${{ secrets.WINDOWS_PFX_BASE64 != '' }}
+        env:
+          WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+
+      - name: Sign snapview.exe
+        if: ${{ secrets.WINDOWS_PFX_BASE64 != '' }}
+        env:
+          WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        shell: pwsh
+        run: |
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $signtool sign /f cert.pfx /p $env:WINDOWS_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/snapview.exe
+          Copy-Item target/release/snapview.exe snapview.exe -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        env:
+          WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: |
+          if (Test-Path cert.pfx) {
+            $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+            $pfx = (Resolve-Path cert.pfx).Path
+            $signCmd = "`"$signtool`" sign /f `"$pfx`" /p $env:WINDOWS_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `$f"
+            & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/Ssigntool=$signCmd" installer/snapview.iss
+          } else {
+            (Get-Content installer/snapview.iss) `
+              -replace '^SignTool=signtool', '; SignTool=signtool' `
+              -replace '^SignedUninstaller=yes', '; SignedUninstaller=yes' `
+              | Set-Content installer/snapview.iss
+            & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/snapview.iss
+          }
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: snapview-windows
-          path: snapview.exe
+          path: |
+            snapview.exe
+            dist/snapview-setup-*.exe
           retention-days: 30
 
       - name: Attach to GitHub Release (only on tag push)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: snapview.exe
+          files: |
+            snapview.exe
+            dist/snapview-setup-*.exe
           generate_release_notes: true
