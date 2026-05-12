@@ -9,6 +9,7 @@ use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
 const THUMB_MAX: u32 = 256;
+const FULL_MAX_DIM: u32 = 4096;
 const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
     "rw2", "pef", "ptx", "srw", "dng", "raw", "rwl", "3fr", "fff", "erf",
@@ -1487,6 +1488,10 @@ fn decode_image(path: &Path) -> LoadedImage {
         Ok(mut img) => {
             let orient = read_exif_orientation(path).unwrap_or(1);
             img = apply_exif_orientation(img, orient);
+            let max_dim = img.width().max(img.height());
+            if max_dim > FULL_MAX_DIM {
+                img = img.resize(FULL_MAX_DIM, FULL_MAX_DIM, image::imageops::FilterType::Triangle);
+            }
             let rgba = img.to_rgba8();
             let size = [rgba.width() as usize, rgba.height() as usize];
             let pixels = rgba.into_raw();
