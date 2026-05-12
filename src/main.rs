@@ -698,6 +698,57 @@ impl SnapView {
         }
         Ok((count, side_count))
     }
+
+    fn cut_filtered(&mut self, dest: &Path) -> std::io::Result<usize> {
+        std::fs::create_dir_all(dest)?;
+        let mut moved: Vec<PathBuf> = Vec::new();
+        for src in &self.filter_selected {
+            let Some(name) = src.file_name() else { continue };
+            let target = dest.join(name);
+            if std::fs::rename(src, &target).is_err() {
+                std::fs::copy(src, &target)?;
+                std::fs::remove_file(src)?;
+            }
+            moved.push(src.clone());
+        }
+        let count = moved.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let cur_path = self.current_path();
+        for p in &moved {
+            self.favorites.remove(p);
+            self.filter_selected.remove(p);
+            self.cache.lock().unwrap().remove(p);
+            self.textures.remove(p);
+            self.rotation.remove(p);
+        }
+        self.images.retain(|p| !moved.contains(p));
+        if let Some(folder) = &self.folder {
+            save_favorites(folder, &self.favorites);
+        }
+        if self.images.is_empty() {
+            self.current = 0;
+        } else {
+            self.current = cur_path
+                .as_ref()
+                .and_then(|p| self.images.iter().position(|x| x == p))
+                .unwrap_or_else(|| self.current.min(self.images.len() - 1));
+            if self.visible_count() > 0 && !self.matches_filter(&self.images[self.current]) {
+                let n = self.images.len();
+                let start = self.current;
+                for d in 0..n {
+                    let f = (start + d) % n;
+                    if self.matches_filter(&self.images[f]) {
+                        self.current = f;
+                        break;
+                    }
+                }
+            }
+        }
+        self.queue_preload();
+        Ok(count)
+    }
 }
 
 impl eframe::App for SnapView {
@@ -1105,10 +1156,11 @@ impl SnapView {
     fn render_filter_window(&mut self, ctx: &egui::Context) {
         let mut open = true;
         let mut do_copy = false;
+        let mut do_cut = false;
         let mut do_select_all = false;
         let mut do_select_none = false;
 
-        egui::Window::new("Filter favorites & copy")
+        egui::Window::new("Filter favorites & copy/cut")
             .open(&mut open)
             .resizable(true)
             .default_size([520.0, 600.0])
@@ -1146,6 +1198,15 @@ impl SnapView {
                     ).clicked() {
                         do_copy = true;
                     }
+                    if ui.add_enabled(
+                        !self.filter_selected.is_empty(),
+                        egui::Button::new(format!(
+                            "Cut {} selected to folder…",
+                            self.filter_selected.len()
+                        )),
+                    ).clicked() {
+                        do_cut = true;
+                    }
                 });
             });
 
@@ -1169,6 +1230,24 @@ impl SnapView {
                         rfd::MessageDialog::new()
                             .set_title("Error")
                             .set_description(format!("Copy failed: {}", e))
+                            .show();
+                    }
+                }
+            }
+        }
+        if do_cut {
+            if let Some(dest) = rfd::FileDialog::new().pick_folder() {
+                match self.cut_filtered(&dest) {
+                    Ok(n) => {
+                        rfd::MessageDialog::new()
+                            .set_title("Done")
+                            .set_description(format!("Moved {} files.", n))
+                            .show();
+                    }
+                    Err(e) => {
+                        rfd::MessageDialog::new()
+                            .set_title("Error")
+                            .set_description(format!("Cut failed: {}", e))
                             .show();
                     }
                 }
