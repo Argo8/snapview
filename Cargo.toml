@@ -16,6 +16,9 @@ kamadak-exif = "0.6"
 trash = "5"
 jpeg-decoder = "0.3"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
