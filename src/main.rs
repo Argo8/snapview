@@ -9,7 +9,7 @@ use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
 const THUMB_MAX: u32 = 256;
-const FULL_MAX_DIM: u32 = 4096;
+const FULL_MAX_DIM: u32 = 2400;
 const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
     "rw2", "pef", "ptx", "srw", "dng", "raw", "rwl", "3fr", "fff", "erf",
@@ -18,8 +18,8 @@ const RAW_EXTS: &[&str] = &[
     "xmp",
 ];
 const FAVORITES_FILE: &str = ".favorites.txt";
-const PRELOAD_RADIUS: usize = 5;
-const TEXTURE_CACHE_MAX: usize = 80;
+const PRELOAD_RADIUS: usize = 3;
+const TEXTURE_CACHE_MAX: usize = 60;
 
 fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = std::env::args().collect();
@@ -1505,37 +1505,34 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::Dynamic
     let f = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(f);
     let mut decoder = jpeg_decoder::Decoder::new(reader);
-    decoder.read_info().ok()?;
-    let info = decoder.info()?;
-    let orig_max = info.width.max(info.height) as u32;
-    let denom: u8 = if target_max_dim == 0 || orig_max == 0 {
-        1
-    } else {
-        let ratio = orig_max / target_max_dim.max(1);
-        if ratio >= 8 { 8 } else if ratio >= 4 { 4 } else if ratio >= 2 { 2 } else { 1 }
-    };
-    if denom != 1 {
-        let _ = decoder.scale(
-            (info.width as u32 / denom as u32).max(1) as u16,
-            (info.height as u32 / denom as u32).max(1) as u16,
-        );
-    }
+    // Must be called before read_info / decode so the JPEG IDCT runs at the
+    // smaller scale natively (1/2, 1/4 or 1/8 of the original size).
+    let target = target_max_dim.max(1).min(u16::MAX as u32) as u16;
+    let _ = decoder.scale(target, target);
     let pixels = decoder.decode().ok()?;
     let info = decoder.info()?;
     let w = info.width as u32;
     let h = info.height as u32;
     let rgba: Vec<u8> = match info.pixel_format {
         jpeg_decoder::PixelFormat::RGB24 => {
-            let mut out = Vec::with_capacity((w * h * 4) as usize);
-            for c in pixels.chunks_exact(3) {
-                out.extend_from_slice(&[c[0], c[1], c[2], 255]);
+            let mut out = vec![0u8; (w * h * 4) as usize];
+            for (i, c) in pixels.chunks_exact(3).enumerate() {
+                let o = i * 4;
+                out[o] = c[0];
+                out[o + 1] = c[1];
+                out[o + 2] = c[2];
+                out[o + 3] = 255;
             }
             out
         }
         jpeg_decoder::PixelFormat::L8 => {
-            let mut out = Vec::with_capacity((w * h * 4) as usize);
-            for &v in &pixels {
-                out.extend_from_slice(&[v, v, v, 255]);
+            let mut out = vec![0u8; (w * h * 4) as usize];
+            for (i, &v) in pixels.iter().enumerate() {
+                let o = i * 4;
+                out[o] = v;
+                out[o + 1] = v;
+                out[o + 2] = v;
+                out[o + 3] = 255;
             }
             out
         }
@@ -1546,17 +1543,25 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::Dynamic
 }
 
 fn decode_image(path: &Path) -> LoadedImage {
-    let img = if is_jpeg(path) {
-        decode_jpeg_scaled(path, FULL_MAX_DIM).or_else(|| image::open(path).ok())
+    let (img, did_jpeg_scale) = if is_jpeg(path) {
+        match decode_jpeg_scaled(path, FULL_MAX_DIM) {
+            Some(i) => (Some(i), true),
+            None => (image::open(path).ok(), false),
+        }
     } else {
-        image::open(path).ok()
+        (image::open(path).ok(), false)
     };
     let Some(mut img) = img else { return LoadedImage::Failed };
     let orient = read_exif_orientation(path).unwrap_or(1);
     img = apply_exif_orientation(img, orient);
-    let max_dim = img.width().max(img.height());
-    if max_dim > FULL_MAX_DIM {
-        img = img.resize(FULL_MAX_DIM, FULL_MAX_DIM, image::imageops::FilterType::Triangle);
+    // jpeg-decoder already produced a near-target size via native DCT scaling.
+    // Only fall back to a (slow) software resize for non-JPEG formats above
+    // the cap.
+    if !did_jpeg_scale {
+        let max_dim = img.width().max(img.height());
+        if max_dim > FULL_MAX_DIM {
+            img = img.resize(FULL_MAX_DIM, FULL_MAX_DIM, image::imageops::FilterType::Triangle);
+        }
     }
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
