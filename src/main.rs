@@ -17,7 +17,8 @@ const RAW_EXTS: &[&str] = &[
     "xmp",
 ];
 const FAVORITES_FILE: &str = ".favorites.txt";
-const PRELOAD_RADIUS: usize = 2;
+const PRELOAD_RADIUS: usize = 5;
+const TEXTURE_CACHE_MAX: usize = 80;
 
 fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = std::env::args().collect();
@@ -412,14 +413,12 @@ impl SnapView {
                     cache.insert(path.clone(), result.clone());
                     drop(cache);
                     if let LoadedImage::Ready(ci) = result {
-                        if self.is_near_current(&path) {
-                            let tex = ctx.load_texture(
-                                path.to_string_lossy().to_string(),
-                                (*ci).clone(),
-                                egui::TextureOptions::LINEAR,
-                            );
-                            self.textures.insert(path, tex);
-                        }
+                        let tex = ctx.load_texture(
+                            path.to_string_lossy().to_string(),
+                            (*ci).clone(),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.textures.insert(path, tex);
                     }
                 }
                 JobResult::Thumb(path, result, dims) => {
@@ -439,27 +438,24 @@ impl SnapView {
             }
         }
 
-        if !self.images.is_empty() {
-            let near: HashSet<PathBuf> = self.near_current_paths();
-            self.textures.retain(|p, _| near.contains(p));
+        if self.textures.len() > TEXTURE_CACHE_MAX && !self.images.is_empty() {
+            let cur = self.current;
+            let pos: HashMap<PathBuf, usize> = self
+                .images
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.clone(), i))
+                .collect();
+            let mut keys: Vec<PathBuf> = self.textures.keys().cloned().collect();
+            keys.sort_by_key(|p| {
+                pos.get(p)
+                    .map(|i| (*i as isize - cur as isize).abs())
+                    .unwrap_or(isize::MAX)
+            });
+            for p in keys.into_iter().skip(TEXTURE_CACHE_MAX) {
+                self.textures.remove(&p);
+            }
         }
-    }
-
-    fn near_current_paths(&self) -> HashSet<PathBuf> {
-        let mut s = HashSet::new();
-        if self.images.is_empty() { return s; }
-        let n = self.images.len();
-        let cur = self.current;
-        s.insert(self.images[cur].clone());
-        for d in 1..=PRELOAD_RADIUS {
-            if cur + d < n { s.insert(self.images[cur + d].clone()); }
-            if cur >= d { s.insert(self.images[cur - d].clone()); }
-        }
-        s
-    }
-
-    fn is_near_current(&self, p: &Path) -> bool {
-        self.near_current_paths().iter().any(|x| x == p)
     }
 
     fn ensure_texture(&mut self, ctx: &egui::Context, path: &Path) {
