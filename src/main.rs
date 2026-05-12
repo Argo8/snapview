@@ -129,6 +129,16 @@ struct SnapView {
     pan: egui::Vec2,
     target_pan: egui::Vec2,
     last_view_path: Option<PathBuf>,
+
+    touch_swipe: Option<TouchSwipe>,
+}
+
+#[derive(Clone, Copy)]
+struct TouchSwipe {
+    id: egui::TouchId,
+    start: egui::Pos2,
+    last: egui::Pos2,
+    triggered: bool,
 }
 
 enum JobResult {
@@ -262,6 +272,7 @@ impl SnapView {
             pan: egui::Vec2::ZERO,
             target_pan: egui::Vec2::ZERO,
             last_view_path: None,
+            touch_swipe: None,
         };
 
         if let Some(p) = initial_path {
@@ -796,7 +807,7 @@ impl eframe::App for SnapView {
                 }
                 if i.key_pressed(egui::Key::Delete) { self.actions.delete = true; }
                 if i.key_pressed(egui::Key::Escape) {
-                    if self.is_maximized { self.actions.toggle_max = true; }
+                    if self.is_fullscreen { self.actions.toggle_max = true; }
                     else { self.actions.quit = true; }
                 }
                 if i.key_pressed(egui::Key::O) && i.modifiers.ctrl { self.actions.open_folder = true; }
@@ -832,6 +843,8 @@ impl eframe::App for SnapView {
             self.render_overlay(ui);
             self.handle_background_interaction(ui, ctx);
             self.render_close_button(ui);
+            self.render_nav_chevrons(ui);
+            self.handle_touch_swipe(ui);
         });
 
         if self.show_filter {
@@ -1019,7 +1032,7 @@ impl SnapView {
     }
 
     fn render_close_button(&mut self, ui: &mut egui::Ui) {
-        if self.is_maximized { return; }
+        if self.is_fullscreen { return; }
         let rect = ui.available_rect_before_wrap();
         let hover_zone = egui::Rect::from_min_size(
             egui::pos2(rect.right() - 90.0, rect.top()),
@@ -1063,6 +1076,85 @@ impl SnapView {
         }
     }
 
+    fn render_nav_chevrons(&mut self, ui: &mut egui::Ui) {
+        if self.images.is_empty() { return; }
+        let rect = ui.available_rect_before_wrap();
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let zone_w = 110.0;
+        let btn_w = 36.0;
+        let btn_h = 56.0;
+
+        let left_zone = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - 100.0),
+            egui::vec2(zone_w, 200.0),
+        );
+        let right_zone = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - zone_w, rect.center().y - 100.0),
+            egui::vec2(zone_w, 200.0),
+        );
+        let in_left = pointer.map(|p| left_zone.contains(p)).unwrap_or(false);
+        let in_right = pointer.map(|p| right_zone.contains(p)).unwrap_or(false);
+
+        let left_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 14.0, rect.center().y - btn_h / 2.0),
+            egui::vec2(btn_w, btn_h),
+        );
+        let right_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - btn_w - 14.0, rect.center().y - btn_h / 2.0),
+            egui::vec2(btn_w, btn_h),
+        );
+
+        let left_resp = ui.interact(left_rect, egui::Id::new("nav_left"), egui::Sense::click());
+        let right_resp = ui.interact(right_rect, egui::Id::new("nav_right"), egui::Sense::click());
+
+        if in_left || left_resp.hovered() {
+            draw_chevron(ui.painter(), left_rect, left_resp.hovered(), false);
+        }
+        if in_right || right_resp.hovered() {
+            draw_chevron(ui.painter(), right_rect, right_resp.hovered(), true);
+        }
+        if left_resp.clicked() { self.actions.prev = true; }
+        if right_resp.clicked() { self.actions.next = true; }
+    }
+
+    fn handle_touch_swipe(&mut self, ui: &mut egui::Ui) {
+        let events = ui.input(|i| i.events.clone());
+        for ev in events {
+            if let egui::Event::Touch { id, phase, pos, .. } = ev {
+                match phase {
+                    egui::TouchPhase::Start => {
+                        self.touch_swipe = Some(TouchSwipe {
+                            id,
+                            start: pos,
+                            last: pos,
+                            triggered: false,
+                        });
+                    }
+                    egui::TouchPhase::Move => {
+                        if let Some(s) = self.touch_swipe.as_mut() {
+                            if s.id == id { s.last = pos; }
+                        }
+                    }
+                    egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                        if let Some(s) = self.touch_swipe {
+                            if s.id == id && !s.triggered {
+                                let dx = pos.x - s.start.x;
+                                let dy = pos.y - s.start.y;
+                                if dx.abs() > 60.0 && dx.abs() > dy.abs() * 1.5 {
+                                    if dx < 0.0 { self.actions.next = true; }
+                                    else { self.actions.prev = true; }
+                                }
+                            }
+                            if self.touch_swipe.map(|t| t.id == id).unwrap_or(false) {
+                                self.touch_swipe = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_background_interaction(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let resp = ui.interact(
             ui.available_rect_before_wrap(),
@@ -1100,9 +1192,6 @@ impl SnapView {
                 self.actions.open_folder = true;
                 ui.close_menu();
             }
-            ui.separator();
-            if ui.button("Next  (→)").clicked() { self.actions.next = true; ui.close_menu(); }
-            if ui.button("Previous  (←)").clicked() { self.actions.prev = true; ui.close_menu(); }
             ui.separator();
             if ui.button("Rotate left  (Q)").clicked() { self.actions.rot_left = true; ui.close_menu(); }
             if ui.button("Rotate right  (W)").clicked() { self.actions.rot_right = true; ui.close_menu(); }
@@ -1308,6 +1397,28 @@ impl SnapView {
 }
 
 // ---------- helpers ----------
+
+fn draw_chevron(painter: &egui::Painter, rect: egui::Rect, hovered: bool, points_right: bool) {
+    let color = if hovered {
+        egui::Color32::from_rgba_premultiplied(255, 255, 255, 240)
+    } else {
+        egui::Color32::from_rgba_premultiplied(220, 220, 220, 180)
+    };
+    let stroke = egui::Stroke::new(3.0, color);
+    let pad_x = 10.0;
+    let pad_y = 12.0;
+    let mid_y = rect.center().y;
+    let (tip_x, base_x) = if points_right {
+        (rect.right() - pad_x, rect.left() + pad_x)
+    } else {
+        (rect.left() + pad_x, rect.right() - pad_x)
+    };
+    let top = egui::pos2(base_x, rect.top() + pad_y);
+    let bot = egui::pos2(base_x, rect.bottom() - pad_y);
+    let tip = egui::pos2(tip_x, mid_y);
+    painter.line_segment([top, tip], stroke);
+    painter.line_segment([bot, tip], stroke);
+}
 
 fn is_image(p: &Path) -> bool {
     p.extension()
