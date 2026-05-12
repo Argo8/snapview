@@ -1,13 +1,21 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 use eframe::egui;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
+const THUMB_MAX: u32 = 256;
+const RAW_EXTS: &[&str] = &[
+    "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
+    "rw2", "pef", "ptx", "srw", "dng", "raw", "rwl", "3fr", "fff", "erf",
+    "iiq", "mef", "mos", "mrw", "x3f", "x3i", "kdc", "dcr", "ari", "bay",
+    "cap", "dcs", "drf", "k25", "mdc", "obm", "ori", "pxn", "r3d", "rwz",
+    "xmp",
+];
 const FAVORITES_FILE: &str = ".favorites.txt";
 const PRELOAD_RADIUS: usize = 2;
 
@@ -40,7 +48,6 @@ fn main() -> Result<(), eframe::Error> {
 
 #[derive(Clone)]
 enum LoadedImage {
-    Loading,
     Ready(Arc<egui::ColorImage>),
     Failed,
 }
@@ -58,6 +65,8 @@ struct PendingActions {
     open_filter: bool,
     cycle_filter: bool,
     delete: bool,
+    confirm_delete: bool,
+    cancel_delete: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,18 +102,33 @@ struct SnapView {
     cache: Arc<Mutex<HashMap<PathBuf, LoadedImage>>>,
     textures: HashMap<PathBuf, egui::TextureHandle>,
     rotation: HashMap<PathBuf, i32>,
+    sidecars: HashMap<PathBuf, Vec<PathBuf>>,
 
-    load_tx: mpsc::Sender<LoadJob>,
-    result_rx: mpsc::Receiver<(PathBuf, LoadedImage)>,
+    thumb_cache: Arc<Mutex<HashMap<PathBuf, LoadedImage>>>,
+    thumb_textures: HashMap<PathBuf, egui::TextureHandle>,
+    full_dims: HashMap<PathBuf, [usize; 2]>,
+
+    full_q: Arc<PrioQueue>,
+    thumb_q: Arc<PrioQueue>,
+    result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
     filter_selected: HashSet<PathBuf>,
 
-    is_maximized: bool,
+    is_fullscreen: bool,
     actions: PendingActions,
 
     filter_mode: FilterMode,
     filter_msg: Option<(String, f32)>,
+
+    pending_delete: Option<PathBuf>,
+    last_image_rect: Option<egui::Rect>,
+
+    zoom: f32,
+    target_zoom: f32,
+    pan: egui::Vec2,
+    target_pan: egui::Vec2,
+    last_view_path: Option<PathBuf>,
 
     touch_swipe: Option<TouchSwipe>,
 }
@@ -117,31 +141,105 @@ struct TouchSwipe {
     triggered: bool,
 }
 
-struct LoadJob {
-    path: PathBuf,
+enum JobResult {
+    Full(PathBuf, LoadedImage),
+    Thumb(PathBuf, LoadedImage, Option<[usize; 2]>),
+}
+
+struct PrioQueueInner {
+    queue: VecDeque<PathBuf>,
+    in_queue: HashSet<PathBuf>,
+    closed: bool,
+}
+
+struct PrioQueue {
+    inner: Mutex<PrioQueueInner>,
+    cv: Condvar,
+}
+
+impl PrioQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(PrioQueueInner {
+                queue: VecDeque::new(),
+                in_queue: HashSet::new(),
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn enqueue_back(&self, paths: &[PathBuf]) {
+        let mut g = self.inner.lock().unwrap();
+        for p in paths {
+            if g.in_queue.insert(p.clone()) {
+                g.queue.push_back(p.clone());
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    fn prioritize(&self, paths: &[PathBuf]) {
+        let mut g = self.inner.lock().unwrap();
+        for p in paths.iter().rev() {
+            if let Some(pos) = g.queue.iter().position(|x| x == p) {
+                g.queue.remove(pos);
+                g.queue.push_front(p.clone());
+            } else if g.in_queue.insert(p.clone()) {
+                g.queue.push_front(p.clone());
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    fn clear(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.queue.clear();
+        g.in_queue.clear();
+    }
+
+    fn pop(&self) -> Option<PathBuf> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if let Some(p) = g.queue.pop_front() {
+                g.in_queue.remove(&p);
+                return Some(p);
+            }
+            if g.closed { return None; }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
 }
 
 impl SnapView {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
-        let (load_tx, load_rx) = mpsc::channel::<LoadJob>();
-        let (result_tx, result_rx) = mpsc::channel::<(PathBuf, LoadedImage)>();
-        let load_rx = Arc::new(Mutex::new(load_rx));
+        let (result_tx, result_rx) = mpsc::channel::<JobResult>();
+        let full_q = PrioQueue::new();
+        let thumb_q = PrioQueue::new();
 
-        let n_workers = num_workers();
-        for _ in 0..n_workers {
-            let rx = Arc::clone(&load_rx);
+        let total = num_workers();
+        let n_full = (total / 2).max(2);
+        let n_thumb = (total - n_full).max(1);
+
+        for _ in 0..n_full {
+            let q = Arc::clone(&full_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
             thread::spawn(move || loop {
-                let job = {
-                    let lock = rx.lock().unwrap();
-                    match lock.recv() {
-                        Ok(j) => j,
-                        Err(_) => break,
-                    }
-                };
-                let result = decode_image(&job.path);
-                let _ = tx.send((job.path, result));
+                let path = match q.pop() { Some(p) => p, None => break };
+                let r = decode_image(&path);
+                let _ = tx.send(JobResult::Full(path, r));
+                ctx.request_repaint();
+            });
+        }
+        for _ in 0..n_thumb {
+            let q = Arc::clone(&thumb_q);
+            let tx = result_tx.clone();
+            let ctx = cc.egui_ctx.clone();
+            thread::spawn(move || loop {
+                let path = match q.pop() { Some(p) => p, None => break };
+                let (r, dims) = decode_thumb(&path);
+                let _ = tx.send(JobResult::Thumb(path, r, dims));
                 ctx.request_repaint();
             });
         }
@@ -154,14 +252,26 @@ impl SnapView {
             cache: Arc::new(Mutex::new(HashMap::new())),
             textures: HashMap::new(),
             rotation: HashMap::new(),
-            load_tx,
+            sidecars: HashMap::new(),
+            thumb_cache: Arc::new(Mutex::new(HashMap::new())),
+            thumb_textures: HashMap::new(),
+            full_dims: HashMap::new(),
+            full_q,
+            thumb_q,
             result_rx,
             show_filter: false,
             filter_selected: HashSet::new(),
-            is_maximized: false,
+            is_fullscreen: false,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
+            pending_delete: None,
+            last_image_rect: None,
+            zoom: 1.0,
+            target_zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            target_pan: egui::Vec2::ZERO,
+            last_view_path: None,
             touch_swipe: None,
         };
 
@@ -183,22 +293,58 @@ impl SnapView {
     }
 
     fn open_folder(&mut self, folder: &Path, select: Option<PathBuf>) {
-        let mut images: Vec<PathBuf> = std::fs::read_dir(folder)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| is_image(p))
-                    .collect()
-            })
+        let all: Vec<PathBuf> = std::fs::read_dir(folder)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
             .unwrap_or_default();
+
+        let mut images: Vec<PathBuf> = all.iter().filter(|p| is_image(p)).cloned().collect();
         images.sort();
+
+        // Group raw sidecars by stem
+        let mut by_stem: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for p in &all {
+            if !is_raw_sidecar(p) { continue; }
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                by_stem.entry(stem.to_lowercase()).or_default().push(p.clone());
+            }
+        }
+        let mut sidecars: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        for img in &images {
+            if let Some(stem) = img.file_stem().and_then(|s| s.to_str()) {
+                if let Some(list) = by_stem.get(&stem.to_lowercase()) {
+                    sidecars.insert(img.clone(), list.clone());
+                }
+            }
+        }
 
         self.folder = Some(folder.to_path_buf());
         self.favorites = load_favorites(folder, &images);
         self.images = images;
+        self.sidecars = sidecars;
         self.cache.lock().unwrap().clear();
+        self.thumb_cache.lock().unwrap().clear();
         self.textures.clear();
+        self.thumb_textures.clear();
+        self.full_dims.clear();
         self.rotation.clear();
+
+        self.thumb_q.clear();
+        self.full_q.clear();
+
+        let n = self.images.len();
+        let cur = if let Some(sel) = &select {
+            self.images.iter().position(|p| p == sel).unwrap_or(0)
+        } else {
+            0
+        };
+        // Bulk fill: every image, in order radiating outward from `cur`.
+        let mut order: Vec<PathBuf> = Vec::with_capacity(n);
+        if n > 0 { order.push(self.images[cur].clone()); }
+        for d in 1..n {
+            if cur + d < n { order.push(self.images[cur + d].clone()); }
+            if cur >= d { order.push(self.images[cur - d].clone()); }
+        }
+        self.thumb_q.enqueue_back(&order);
 
         self.current = if let Some(sel) = select {
             self.images.iter().position(|p| p == &sel).unwrap_or(0)
@@ -207,6 +353,30 @@ impl SnapView {
         };
 
         self.queue_preload();
+        self.prioritize_thumbs();
+    }
+
+    fn prioritize_thumbs(&self) {
+        if self.images.is_empty() { return; }
+        const RADIUS: usize = 12;
+        let n = self.images.len();
+        let cur = self.current;
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(RADIUS * 2 + 1);
+        paths.push(self.images[cur].clone());
+        for d in 1..=RADIUS {
+            if cur + d < n { paths.push(self.images[cur + d].clone()); }
+            if cur >= d { paths.push(self.images[cur - d].clone()); }
+        }
+        // Drop already-loaded ones from the priority list.
+        let cache = self.thumb_cache.lock().unwrap();
+        let pending: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| !matches!(cache.get(p), Some(LoadedImage::Ready(_)) | Some(LoadedImage::Failed)))
+            .collect();
+        drop(cache);
+        if !pending.is_empty() {
+            self.thumb_q.prioritize(&pending);
+        }
     }
 
     fn queue_preload(&self) {
@@ -214,42 +384,54 @@ impl SnapView {
         let n = self.images.len();
         let cur = self.current;
 
-        let mut to_queue: Vec<PathBuf> = Vec::new();
-        let mut cache = self.cache.lock().unwrap();
-
-        let mut consider = |to_queue: &mut Vec<PathBuf>, cache: &mut HashMap<PathBuf, LoadedImage>, p: &PathBuf| {
-            if !cache.contains_key(p) {
-                cache.insert(p.clone(), LoadedImage::Loading);
-                to_queue.push(p.clone());
-            }
-        };
-
-        consider(&mut to_queue, &mut cache, &self.images[cur]);
+        let mut paths: Vec<PathBuf> = Vec::new();
+        paths.push(self.images[cur].clone());
         for d in 1..=PRELOAD_RADIUS {
-            if cur + d < n { consider(&mut to_queue, &mut cache, &self.images[cur + d]); }
-            if cur >= d { consider(&mut to_queue, &mut cache, &self.images[cur - d]); }
+            if cur + d < n { paths.push(self.images[cur + d].clone()); }
+            if cur >= d { paths.push(self.images[cur - d].clone()); }
         }
+        let cache = self.cache.lock().unwrap();
+        let pending: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| !matches!(cache.get(p), Some(LoadedImage::Ready(_)) | Some(LoadedImage::Failed)))
+            .collect();
         drop(cache);
-
-        for p in to_queue {
-            let _ = self.load_tx.send(LoadJob { path: p });
+        if !pending.is_empty() {
+            self.full_q.prioritize(&pending);
         }
     }
 
     fn drain_results(&mut self, ctx: &egui::Context) {
-        while let Ok((path, result)) = self.result_rx.try_recv() {
-            let mut cache = self.cache.lock().unwrap();
-            cache.insert(path.clone(), result.clone());
-            drop(cache);
-
-            if let LoadedImage::Ready(ci) = result {
-                if self.is_near_current(&path) {
-                    let tex = ctx.load_texture(
-                        path.to_string_lossy().to_string(),
-                        (*ci).clone(),
-                        egui::TextureOptions::LINEAR,
-                    );
-                    self.textures.insert(path, tex);
+        while let Ok(res) = self.result_rx.try_recv() {
+            match res {
+                JobResult::Full(path, result) => {
+                    let mut cache = self.cache.lock().unwrap();
+                    cache.insert(path.clone(), result.clone());
+                    drop(cache);
+                    if let LoadedImage::Ready(ci) = result {
+                        if self.is_near_current(&path) {
+                            let tex = ctx.load_texture(
+                                path.to_string_lossy().to_string(),
+                                (*ci).clone(),
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.textures.insert(path, tex);
+                        }
+                    }
+                }
+                JobResult::Thumb(path, result, dims) => {
+                    let mut tc = self.thumb_cache.lock().unwrap();
+                    tc.insert(path.clone(), result.clone());
+                    drop(tc);
+                    if let Some(d) = dims { self.full_dims.insert(path.clone(), d); }
+                    if let LoadedImage::Ready(ci) = result {
+                        let tex = ctx.load_texture(
+                            format!("thumb:{}", path.to_string_lossy()),
+                            (*ci).clone(),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.thumb_textures.insert(path, tex);
+                    }
                 }
             }
         }
@@ -332,6 +514,7 @@ impl SnapView {
             if self.matches_filter(&self.images[idx]) {
                 self.current = idx;
                 self.queue_preload();
+                self.prioritize_thumbs();
                 return;
             }
         }
@@ -363,15 +546,29 @@ impl SnapView {
             }
         }
         self.queue_preload();
+        self.prioritize_thumbs();
     }
 
-    fn delete_current(&mut self) {
-        let path = match self.current_path() {
+    fn request_delete(&mut self) {
+        if let Some(p) = self.current_path() {
+            self.pending_delete = Some(p);
+        }
+    }
+
+    fn confirm_delete(&mut self) {
+        let path = match self.pending_delete.take() {
             Some(p) => p,
             None => return,
         };
-        let ok = trash::delete(&path).is_ok();
-        if !ok {
+        let idx = match self.images.iter().position(|p| p == &path) {
+            Some(i) => i,
+            None => return,
+        };
+        let mut to_trash: Vec<PathBuf> = vec![path.clone()];
+        if let Some(side) = self.sidecars.get(&path) {
+            to_trash.extend(side.iter().cloned());
+        }
+        if trash::delete_all(&to_trash).is_err() {
             self.filter_msg = Some(("Delete failed".to_string(), 2.0));
             return;
         }
@@ -382,9 +579,15 @@ impl SnapView {
             }
         }
         self.cache.lock().unwrap().remove(&path);
+        self.thumb_cache.lock().unwrap().remove(&path);
         self.textures.remove(&path);
+        self.thumb_textures.remove(&path);
         self.rotation.remove(&path);
-        self.images.remove(self.current);
+        self.sidecars.remove(&path);
+        self.images.remove(idx);
+        if idx <= self.current && self.current > 0 {
+            self.current -= 1;
+        }
 
         if self.images.is_empty() {
             self.current = 0;
@@ -392,7 +595,6 @@ impl SnapView {
             if self.current >= self.images.len() {
                 self.current = self.images.len() - 1;
             }
-            // ensure current points to a visible image (if any visible)
             if self.visible_count() > 0 && !self.matches_filter(&self.images[self.current]) {
                 let n = self.images.len();
                 let start = self.current;
@@ -405,8 +607,15 @@ impl SnapView {
                 }
             }
         }
-        self.filter_msg = Some(("Moved to trash".to_string(), 1.2));
+        let extra = to_trash.len() - 1;
+        let msg = if extra > 0 {
+            format!("Moved to trash (+ {} sidecar{})", extra, if extra == 1 { "" } else { "s" })
+        } else {
+            "Moved to trash".to_string()
+        };
+        self.filter_msg = Some((msg, 1.2));
         self.queue_preload();
+        self.prioritize_thumbs();
     }
 
     fn rotate(&mut self, delta: i32) {
@@ -432,17 +641,73 @@ impl SnapView {
         self.images.get(self.current).cloned()
     }
 
-    fn copy_filtered(&self, dest: &Path) -> std::io::Result<usize> {
+    fn reset_view(&mut self) {
+        self.zoom = 1.0;
+        self.target_zoom = 1.0;
+        self.pan = egui::Vec2::ZERO;
+        self.target_pan = egui::Vec2::ZERO;
+    }
+
+    fn apply_zoom(&mut self, factor: f32, hover: Option<egui::Pos2>, ctx: &egui::Context) {
+        let new_target = (self.target_zoom * factor).clamp(1.0, 32.0);
+        if (new_target - self.target_zoom).abs() < 0.0001 { return; }
+        let k = new_target / self.target_zoom;
+        let center = ctx.screen_rect().center();
+        let s = hover.unwrap_or(center);
+        self.target_pan = (s - center) * (1.0 - k) + self.target_pan * k;
+        self.target_zoom = new_target;
+        if self.target_zoom <= 1.0001 {
+            self.target_pan = egui::Vec2::ZERO;
+        }
+        ctx.request_repaint();
+    }
+
+    fn animate_view(&mut self, dt: f32) -> bool {
+        let zoom_diff = self.target_zoom - self.zoom;
+        let pan_diff = self.target_pan - self.pan;
+        let any = zoom_diff.abs() > 0.0005 || pan_diff.length() > 0.05;
+        if !any {
+            self.zoom = self.target_zoom;
+            self.pan = self.target_pan;
+            return false;
+        }
+        let t = (dt * 22.0).clamp(0.0, 1.0);
+        self.zoom += zoom_diff * t;
+        self.pan += pan_diff * t;
+        true
+    }
+
+    fn current_is_portrait(&self) -> bool {
+        let path = match self.current_path() { Some(p) => p, None => return false };
+        let cache = self.cache.lock().unwrap();
+        if let Some(LoadedImage::Ready(ci)) = cache.get(&path) {
+            let rot = *self.rotation.get(&path).unwrap_or(&0);
+            let (w, h) = (ci.size[0], ci.size[1]);
+            let (w, h) = if rot.rem_euclid(2) == 0 { (w, h) } else { (h, w) };
+            return h > w;
+        }
+        false
+    }
+
+    fn copy_filtered(&self, dest: &Path) -> std::io::Result<(usize, usize)> {
         std::fs::create_dir_all(dest)?;
         let mut count = 0;
+        let mut side_count = 0;
         for src in &self.filter_selected {
             if let Some(name) = src.file_name() {
-                let target = dest.join(name);
-                std::fs::copy(src, &target)?;
+                std::fs::copy(src, dest.join(name))?;
                 count += 1;
             }
+            if let Some(sides) = self.sidecars.get(src) {
+                for s in sides {
+                    if let Some(name) = s.file_name() {
+                        std::fs::copy(s, dest.join(name))?;
+                        side_count += 1;
+                    }
+                }
+            }
         }
-        Ok(count)
+        Ok((count, side_count))
     }
 
     fn cut_filtered(&mut self, dest: &Path) -> std::io::Result<usize> {
@@ -505,10 +770,31 @@ impl eframe::App for SnapView {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_results(ctx);
 
+        // Reset view when current image changes
+        let cur_path = self.current_path();
+        if cur_path != self.last_view_path {
+            self.reset_view();
+            self.last_view_path = cur_path;
+        }
+
+        let dt = ctx.input(|i| i.unstable_dt);
+        if self.animate_view(dt) { ctx.request_repaint(); }
+
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+
+        let modal_open = self.pending_delete.is_some();
 
         // Capture keyboard input
         ctx.input(|i| {
+            if modal_open {
+                if i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Y) {
+                    self.actions.confirm_delete = true;
+                }
+                if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::N) {
+                    self.actions.cancel_delete = true;
+                }
+                return;
+            }
             if !self.show_filter {
                 if i.key_pressed(egui::Key::ArrowRight) { self.actions.next = true; }
                 if i.key_pressed(egui::Key::ArrowLeft) { self.actions.prev = true; }
@@ -521,7 +807,7 @@ impl eframe::App for SnapView {
                 }
                 if i.key_pressed(egui::Key::Delete) { self.actions.delete = true; }
                 if i.key_pressed(egui::Key::Escape) {
-                    if self.is_maximized { self.actions.toggle_max = true; }
+                    if self.is_fullscreen { self.actions.toggle_max = true; }
                     else { self.actions.quit = true; }
                 }
                 if i.key_pressed(egui::Key::O) && i.modifiers.ctrl { self.actions.open_folder = true; }
@@ -530,14 +816,26 @@ impl eframe::App for SnapView {
             }
         });
 
-        // Mouse wheel navigation
-        let scroll = ctx.input(|i| i.raw_scroll_delta.y);
-        if scroll.abs() > 1.0 && !self.show_filter {
-            if scroll < 0.0 { self.actions.next = true; }
-            else { self.actions.prev = true; }
+        // Scroll / pinch -> zoom (cursor-anchored)
+        if !self.show_filter && !modal_open {
+            let (scroll_y, zoom_pinch, hover) = ctx.input(|i| {
+                (i.raw_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos())
+            });
+            let mut factor = 1.0_f32;
+            if scroll_y.abs() > 0.5 { factor *= (scroll_y * 0.0018).exp(); }
+            if (zoom_pinch - 1.0).abs() > 0.0005 { factor *= zoom_pinch; }
+            if (factor - 1.0).abs() > 0.0001 {
+                self.apply_zoom(factor, hover, ctx);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Num0)) {
+                self.target_zoom = 1.0;
+                self.target_pan = egui::Vec2::ZERO;
+            }
         }
 
-        let bg_alpha: u8 = if focused { 235 } else { 0 };
+        let portrait = self.current_is_portrait();
+        let suppress_dim = portrait && !self.is_fullscreen && self.target_zoom <= 1.001;
+        let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
@@ -551,6 +849,10 @@ impl eframe::App for SnapView {
 
         if self.show_filter {
             self.render_filter_window(ctx);
+        }
+
+        if self.pending_delete.is_some() {
+            self.render_delete_confirm(ctx);
         }
 
         // Apply queued actions
@@ -573,11 +875,13 @@ impl eframe::App for SnapView {
             }
         }
         if actions.toggle_max {
-            self.is_maximized = !self.is_maximized;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.is_maximized));
+            self.is_fullscreen = !self.is_fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
         }
         if actions.cycle_filter { self.cycle_filter(); }
-        if actions.delete { self.delete_current(); }
+        if actions.delete { self.request_delete(); }
+        if actions.confirm_delete { self.confirm_delete(); }
+        if actions.cancel_delete { self.pending_delete = None; }
 
         // Decay transient filter message
         if let Some((_, ref mut t)) = self.filter_msg {
@@ -613,18 +917,29 @@ impl SnapView {
 
         let rotation_quarter = *self.rotation.get(&path).unwrap_or(&0);
 
-        if let Some(tex) = self.textures.get(&path) {
-            let img_size = tex.size_vec2();
+        let full_tex = self.textures.get(&path).cloned();
+        let tex_opt = full_tex.clone().or_else(|| self.thumb_textures.get(&path).cloned());
+
+        if let Some(tex) = tex_opt {
+            // Prefer full texture's own size; otherwise use stored full dims; finally fall back to texture size.
+            let img_size = if let Some(t) = &full_tex {
+                t.size_vec2()
+            } else if let Some(d) = self.full_dims.get(&path) {
+                egui::vec2(d[0] as f32, d[1] as f32)
+            } else {
+                tex.size_vec2()
+            };
             let (fit_w, fit_h) = if rotation_quarter % 2 == 0 {
                 (img_size.x, img_size.y)
             } else {
                 (img_size.y, img_size.x)
             };
-            let scale = (avail.x / fit_w).min(avail.y / fit_h).min(1.0).max(0.01);
+            let base_scale = (avail.x / fit_w).min(avail.y / fit_h).min(1.0).max(0.01);
+            let scale = base_scale * self.zoom;
             let draw_w = img_size.x * scale;
             let draw_h = img_size.y * scale;
 
-            let center = ui.available_rect_before_wrap().center();
+            let center = ui.available_rect_before_wrap().center() + self.pan;
             let angle = rotation_quarter as f32 * std::f32::consts::FRAC_PI_2;
 
             let mut mesh = egui::Mesh::with_texture(tex.id());
@@ -636,6 +951,11 @@ impl SnapView {
             mesh.rotate(egui::emath::Rot2::from_angle(angle), egui::Pos2::ZERO);
             mesh.translate(center.to_vec2());
             ui.painter().add(egui::Shape::mesh(mesh));
+
+            self.last_image_rect = Some(egui::Rect::from_center_size(
+                center,
+                egui::vec2(fit_w * scale, fit_h * scale),
+            ));
         } else {
             ui.centered_and_justified(|ui| {
                 ui.label(
@@ -657,16 +977,21 @@ impl SnapView {
         };
         let is_fav = self.favorites.contains(&path);
         let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let counter = if self.filter_mode == FilterMode::All {
+        let mut counter = if self.filter_mode == FilterMode::All {
             format!("{} / {}", self.current + 1, self.images.len())
         } else {
             let pos = self.visible_position().map(|p| p + 1).unwrap_or(0);
             format!("{} / {}  ({})", pos, self.visible_count(), self.filter_mode.label())
         };
+        if let Some(sides) = self.sidecars.get(&path) {
+            if !sides.is_empty() {
+                counter.push_str(&format!("   ·   +{} RAW", sides.len()));
+            }
+        }
         let fav_count = self.favorites.len();
 
         let painter = ui.painter();
-        let rect = ui.available_rect_before_wrap();
+        let rect = self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
 
         let text = format!("{}   ·   {}", name, counter);
         painter.text(
@@ -707,7 +1032,7 @@ impl SnapView {
     }
 
     fn render_close_button(&mut self, ui: &mut egui::Ui) {
-        if self.is_maximized { return; }
+        if self.is_fullscreen { return; }
         let rect = ui.available_rect_before_wrap();
         let hover_zone = egui::Rect::from_min_size(
             egui::pos2(rect.right() - 90.0, rect.top()),
@@ -837,11 +1162,23 @@ impl SnapView {
             egui::Sense::click_and_drag(),
         );
 
-        if resp.drag_started_by(egui::PointerButton::Primary) {
+        let zoomed = self.target_zoom > 1.001;
+        if zoomed {
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                let d = resp.drag_delta();
+                self.pan += d;
+                self.target_pan += d;
+            }
+        } else if resp.drag_started_by(egui::PointerButton::Primary) {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
         if resp.double_clicked() {
-            self.actions.toggle_max = true;
+            if zoomed {
+                self.target_zoom = 1.0;
+                self.target_pan = egui::Vec2::ZERO;
+            } else {
+                self.actions.toggle_max = true;
+            }
         }
 
         let is_fav_now = self.current_path()
@@ -872,7 +1209,7 @@ impl SnapView {
             ui.separator();
             if ui.button("Move to trash  (Delete)").clicked() { self.actions.delete = true; ui.close_menu(); }
             ui.separator();
-            if ui.button("Toggle maximize  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
+            if ui.button("Toggle fullscreen  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
         });
     }
@@ -891,6 +1228,67 @@ impl SnapView {
                 }
             }
         }
+    }
+
+    fn render_delete_confirm(&mut self, ctx: &egui::Context) {
+        let path = match &self.pending_delete { Some(p) => p.clone(), None => return };
+        let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let side_count = self.sidecars.get(&path).map(|v| v.len()).unwrap_or(0);
+        let side_names: Vec<String> = self.sidecars.get(&path)
+            .map(|v| v.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).collect())
+            .unwrap_or_default();
+
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("delete_dim"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    egui::Color32::from_rgba_premultiplied(0, 0, 0, 140),
+                );
+                ui.allocate_rect(screen, egui::Sense::click());
+            });
+
+        let mut do_confirm = false;
+        let mut do_cancel = false;
+        egui::Window::new("Delete?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.add_space(4.0);
+                let header = if side_count > 0 {
+                    format!("Move this image and {} RAW/sidecar file{} to trash?", side_count, if side_count == 1 { "" } else { "s" })
+                } else {
+                    "Move this image to trash?".to_string()
+                };
+                ui.label(egui::RichText::new(header).size(15.0));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(&name).color(egui::Color32::from_gray(200)).italics());
+                for sn in &side_names {
+                    ui.label(egui::RichText::new(format!("+ {}", sn)).color(egui::Color32::from_gray(160)).italics().size(12.0));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("Delete  (Enter)")
+                        .fill(egui::Color32::from_rgb(160, 50, 50)))
+                        .clicked()
+                    {
+                        do_confirm = true;
+                    }
+                    if ui.button("Cancel  (Esc)").clicked() {
+                        do_cancel = true;
+                    }
+                });
+                ui.add_space(2.0);
+            });
+
+        if do_confirm { self.actions.confirm_delete = true; }
+        if do_cancel { self.actions.cancel_delete = true; }
     }
 
     fn render_filter_window(&mut self, ctx: &egui::Context) {
@@ -955,10 +1353,15 @@ impl SnapView {
         if do_copy {
             if let Some(dest) = rfd::FileDialog::new().pick_folder() {
                 match self.copy_filtered(&dest) {
-                    Ok(n) => {
+                    Ok((n, s)) => {
+                        let desc = if s > 0 {
+                            format!("Copied {} images + {} RAW/sidecar files.", n, s)
+                        } else {
+                            format!("Copied {} files.", n)
+                        };
                         rfd::MessageDialog::new()
                             .set_title("Done")
-                            .set_description(format!("Copied {} files.", n))
+                            .set_description(desc)
                             .show();
                     }
                     Err(e) => {
@@ -1024,6 +1427,13 @@ fn is_image(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_raw_sidecar(p: &Path) -> bool {
+    p.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| RAW_EXTS.iter().any(|e| e.eq_ignore_ascii_case(s)))
+        .unwrap_or(false)
+}
+
 fn decode_image(path: &Path) -> LoadedImage {
     match image::open(path) {
         Ok(mut img) => {
@@ -1036,6 +1446,23 @@ fn decode_image(path: &Path) -> LoadedImage {
             LoadedImage::Ready(Arc::new(ci))
         }
         Err(_) => LoadedImage::Failed,
+    }
+}
+
+fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>) {
+    match image::open(path) {
+        Ok(mut img) => {
+            let orient = read_exif_orientation(path).unwrap_or(1);
+            img = apply_exif_orientation(img, orient);
+            let full_dims = [img.width() as usize, img.height() as usize];
+            let small = img.thumbnail(THUMB_MAX, THUMB_MAX);
+            let rgba = small.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let pixels = rgba.into_raw();
+            let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+            (LoadedImage::Ready(Arc::new(ci)), Some(full_dims))
+        }
+        Err(_) => (LoadedImage::Failed, None),
     }
 }
 
