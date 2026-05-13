@@ -3,13 +3,20 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
-const THUMB_MAX: u32 = 256;
+const THUMB_MAX: u32 = 768;
+/// Default target dimension for the full-resolution decode. 2400 covers
+/// 1440p displays at 1:1 and leaves headroom for zoom; for JPEGs the
+/// decoder picks the closest native DCT scale that's >= this value (so
+/// 4000-8000 px camera shots decode at 2000-4000 px in ~60-120 ms).
 const FULL_MAX_DIM: u32 = 2400;
+/// Target for the on-demand high-quality re-decode (triggered with Z).
+const HQ_MAX_DIM: u32 = 16384;
 const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
     "rw2", "pef", "ptx", "srw", "dng", "raw", "rwl", "3fr", "fff", "erf",
@@ -70,6 +77,7 @@ struct PendingActions {
     confirm_delete: bool,
     cancel_delete: bool,
     show_about: bool,
+    request_hq: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,6 +122,8 @@ struct SnapView {
 
     full_q: Arc<PrioQueue>,
     thumb_q: Arc<PrioQueue>,
+    hq_mode: Arc<AtomicBool>,
+    zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>>,
     result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
@@ -121,6 +131,9 @@ struct SnapView {
     filter_selected: HashSet<PathBuf>,
 
     is_fullscreen: bool,
+    last_resized_path: Option<PathBuf>,
+    last_aspect_class: Option<i8>,
+    resize_paint_skip: u8,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -221,6 +234,8 @@ impl SnapView {
         let (result_tx, result_rx) = mpsc::channel::<JobResult>();
         let full_q = PrioQueue::new();
         let thumb_q = PrioQueue::new();
+        let hq_mode = Arc::new(AtomicBool::new(false));
+        let zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let total = num_workers();
         let n_full = (total / 2).max(2);
@@ -230,9 +245,14 @@ impl SnapView {
             let q = Arc::clone(&full_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
+            let hq = Arc::clone(&hq_mode);
+            let zoom_hq = Arc::clone(&zoom_hq_paths);
             thread::spawn(move || loop {
                 let path = match q.pop() { Some(p) => p, None => break };
-                let (r, q) = decode_image(&path);
+                let need_hq = hq.load(Ordering::Relaxed)
+                    || zoom_hq.lock().unwrap().contains(&path);
+                let target = if need_hq { HQ_MAX_DIM } else { FULL_MAX_DIM };
+                let (r, q) = decode_image_to(&path, target);
                 let _ = tx.send(JobResult::Full(path, r, q));
                 ctx.request_repaint();
             });
@@ -241,14 +261,11 @@ impl SnapView {
             let q = Arc::clone(&thumb_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
-            thread::spawn(move || {
-                set_low_priority();
-                loop {
-                    let path = match q.pop() { Some(p) => p, None => break };
-                    let (r, dims, qrt) = decode_thumb(&path);
-                    let _ = tx.send(JobResult::Thumb(path, r, dims, qrt));
-                    ctx.request_repaint();
-                }
+            thread::spawn(move || loop {
+                let path = match q.pop() { Some(p) => p, None => break };
+                let (r, dims, qrt) = decode_thumb(&path);
+                let _ = tx.send(JobResult::Thumb(path, r, dims, qrt));
+                ctx.request_repaint();
             });
         }
 
@@ -267,11 +284,16 @@ impl SnapView {
             exif_quarter: HashMap::new(),
             full_q,
             thumb_q,
+            hq_mode,
+            zoom_hq_paths,
             result_rx,
             show_filter: false,
             show_about: false,
             filter_selected: HashSet::new(),
             is_fullscreen: false,
+            last_resized_path: None,
+            last_aspect_class: None,
+            resize_paint_skip: 0,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
@@ -338,6 +360,7 @@ impl SnapView {
         self.full_dims.clear();
         self.exif_quarter.clear();
         self.rotation.clear();
+        self.zoom_hq_paths.lock().unwrap().clear();
 
         self.thumb_q.clear();
         self.full_q.clear();
@@ -437,7 +460,7 @@ impl SnapView {
                             let tex = ctx.load_texture(
                                 path.to_string_lossy().to_string(),
                                 (*ci).clone(),
-                                egui::TextureOptions::LINEAR,
+                                full_texture_options(),
                             );
                             self.textures.insert(path, tex);
                         }
@@ -490,7 +513,7 @@ impl SnapView {
             let tex = ctx.load_texture(
                 path.to_string_lossy().to_string(),
                 (*ci).clone(),
-                egui::TextureOptions::LINEAR,
+                full_texture_options(),
             );
             self.textures.insert(path.to_path_buf(), tex);
         }
@@ -683,6 +706,21 @@ impl SnapView {
         if self.target_zoom <= 1.0001 {
             self.target_pan = egui::Vec2::ZERO;
         }
+        // First zoom past ~1.05 on the current image promotes it to a native
+        // re-decode in the background, so the pixels stay crisp at any zoom
+        // factor. Once promoted, it stays HQ for this session (we don't
+        // downgrade on zoom out — re-decoding is the expensive part).
+        if self.target_zoom > 1.05 {
+            if let Some(p) = self.current_path() {
+                let mut set = self.zoom_hq_paths.lock().unwrap();
+                if set.insert(p.clone()) {
+                    drop(set);
+                    self.cache.lock().unwrap().remove(&p);
+                    self.textures.remove(&p);
+                    self.full_q.prioritize(&[p]);
+                }
+            }
+        }
         ctx.request_repaint();
     }
 
@@ -701,16 +739,80 @@ impl SnapView {
         true
     }
 
+    /// When windowed, only on a portrait ↔ landscape transition: rescale the
+    /// window's width to the new image's aspect, leave height untouched, and
+    /// reposition so the window stays centered around its previous middle.
+    /// Goal is the visual effect "the picture shrunk into portrait" rather
+    /// than "the window jumped sideways".
+    fn maybe_resize_window_to_image(&mut self, ctx: &egui::Context) {
+        let path = match self.current_path() { Some(p) => p, None => return };
+        if self.last_resized_path.as_ref() == Some(&path) { return; }
+        let (iw, ih) = match self.display_dims(&path) { Some(d) => d, None => return };
+        if iw == 0 || ih == 0 { return; }
+        let aspect = iw as f32 / ih as f32;
+        let class: i8 = if aspect < 0.95 { 1 } else { 0 };
+
+        // Skip when aspect class hasn't changed: keep current window unchanged.
+        if Some(class) == self.last_aspect_class {
+            self.last_resized_path = Some(path);
+            return;
+        }
+
+        // Need actual window geometry on screen to recenter. egui makes this
+        // available via ViewportInfo; if it's not populated yet, defer to
+        // next frame.
+        let outer = match ctx.input(|i| i.viewport().outer_rect) {
+            Some(r) => r,
+            None => return,
+        };
+        let new_h = outer.height();
+        let new_w = (new_h * aspect).max(200.0);
+        let new_x = outer.left() + (outer.width() - new_w) / 2.0;
+        let new_y = outer.top();
+
+        if (outer.width() - new_w).abs() < 2.0 {
+            // Nothing to resize; just remember the class.
+            self.last_aspect_class = Some(class);
+            self.last_resized_path = Some(path);
+            return;
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(new_w, new_h)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(new_x, new_y)));
+        // Skip painting for a couple of frames so the OS resize doesn't
+        // stretch the old image into the new bounds (visible as a flash).
+        self.resize_paint_skip = 2;
+
+        self.last_aspect_class = Some(class);
+        self.last_resized_path = Some(path);
+    }
+
     fn current_is_portrait(&self) -> bool {
         let path = match self.current_path() { Some(p) => p, None => return false };
-        let cache = self.cache.lock().unwrap();
-        if let Some(LoadedImage::Ready(ci)) = cache.get(&path) {
-            let rot = *self.rotation.get(&path).unwrap_or(&0);
-            let (w, h) = (ci.size[0], ci.size[1]);
-            let (w, h) = if rot.rem_euclid(2) == 0 { (w, h) } else { (h, w) };
-            return h > w;
-        }
-        false
+        let (w, h) = match self.display_dims(&path) {
+            Some(d) => d,
+            None => return false,
+        };
+        h > w
+    }
+
+    /// Returns the on-screen (post-rotation) dimensions of the image, using
+    /// any cached info available — full cache, thumb full_dims, or the texture
+    /// itself. EXIF and user rotation both factored in.
+    fn display_dims(&self, path: &Path) -> Option<(usize, usize)> {
+        let raw = if let Some(LoadedImage::Ready(ci)) = self.cache.lock().unwrap().get(path) {
+            Some((ci.size[0], ci.size[1]))
+        } else if let Some(d) = self.full_dims.get(path) {
+            Some((d[0], d[1]))
+        } else if let Some(tex) = self.textures.get(path).or_else(|| self.thumb_textures.get(path)) {
+            let s = tex.size_vec2();
+            Some((s.x as usize, s.y as usize))
+        } else {
+            None
+        }?;
+        let rot = self.rotation.get(path).copied().unwrap_or(0)
+            + self.exif_quarter.get(path).copied().unwrap_or(0);
+        if rot.rem_euclid(2) == 0 { Some(raw) } else { Some((raw.1, raw.0)) }
     }
 
     fn copy_filtered(&self, dest: &Path) -> std::io::Result<(usize, usize)> {
@@ -828,6 +930,7 @@ impl eframe::App for SnapView {
                 if i.key_pressed(egui::Key::Q) { self.actions.rot_left = true; }
                 if i.key_pressed(egui::Key::W) { self.actions.rot_right = true; }
                 if i.key_pressed(egui::Key::Space) { self.actions.toggle_fav = true; }
+                if i.key_pressed(egui::Key::Z) { self.actions.request_hq = true; }
                 if i.key_pressed(egui::Key::F) {
                     if i.modifiers.shift { self.actions.open_filter = true; }
                     else { self.actions.cycle_filter = true; }
@@ -862,16 +965,39 @@ impl eframe::App for SnapView {
 
         let portrait = self.current_is_portrait();
         let suppress_dim = portrait && !self.is_fullscreen && self.target_zoom <= 1.001;
-        let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
+        if !self.is_fullscreen {
+            self.maybe_resize_window_to_image(ctx);
+        }
+        // During an OS resize the previous frame's content gets stretched into
+        // the new bounds, producing a visible flash. For a couple of frames
+        // after we send the resize command we paint nothing — the desktop /
+        // app behind shows through transparently instead.
+        let resizing = self.resize_paint_skip > 0;
+        if resizing {
+            self.resize_paint_skip -= 1;
+        }
+        let bg_alpha: u8 = if resizing {
+            0
+        } else if focused && !suppress_dim {
+            235
+        } else {
+            0
+        };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
-            self.render_image(ui, ctx);
-            self.render_overlay(ui);
-            self.handle_background_interaction(ui, ctx);
-            self.render_close_button(ui);
-            self.render_nav_chevrons(ui);
-            self.handle_touch_swipe(ui);
+            if !resizing {
+                self.render_image(ui, ctx);
+                self.render_overlay(ui);
+                self.handle_background_interaction(ui, ctx);
+                self.render_close_button(ui);
+                self.render_nav_chevrons(ui);
+                self.handle_touch_swipe(ui);
+            } else {
+                // Keep continuous repaint requests flowing so we exit the
+                // skip-frames state promptly.
+                ctx.request_repaint();
+            }
         });
 
         if self.show_filter {
@@ -908,12 +1034,30 @@ impl eframe::App for SnapView {
         if actions.toggle_max {
             self.is_fullscreen = !self.is_fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+            // Re-evaluate window sizing on next frame when leaving fullscreen.
+            self.last_resized_path = None;
+            self.last_aspect_class = None;
         }
         if actions.cycle_filter { self.cycle_filter(); }
         if actions.delete { self.request_delete(); }
         if actions.confirm_delete { self.confirm_delete(); }
         if actions.cancel_delete { self.pending_delete = None; }
         if actions.show_about { self.show_about = true; }
+        if actions.request_hq {
+            // Global HQ mode toggle: when on, all subsequent decodes target
+            // native resolution. Existing cached/uploaded textures are
+            // discarded so the active image gets re-decoded at the new tier.
+            let new_mode = !self.hq_mode.load(Ordering::Relaxed);
+            self.hq_mode.store(new_mode, Ordering::Relaxed);
+            self.cache.lock().unwrap().clear();
+            self.textures.clear();
+            self.full_q.clear();
+            self.queue_preload();
+            self.filter_msg = Some((
+                if new_mode { "HQ mode" } else { "Snappy mode" }.to_string(),
+                1.2,
+            ));
+        }
 
         // Decay transient filter message
         if let Some((_, ref mut t)) = self.filter_msg {
@@ -991,6 +1135,20 @@ impl SnapView {
                 egui::vec2(fit_w * scale, fit_h * scale),
             ));
         } else {
+            // No texture yet, but keep last_image_rect in sync with the
+            // image's known aspect so overlays/chevrons sit in the right
+            // place during the brief decode window.
+            if let Some((w, h)) = self.display_dims(&path) {
+                let fit_w = w as f32;
+                let fit_h = h as f32;
+                let base_scale = (avail.x / fit_w).min(avail.y / fit_h).min(1.0).max(0.01);
+                let scale = base_scale * self.zoom;
+                let center = ui.available_rect_before_wrap().center() + self.pan;
+                self.last_image_rect = Some(egui::Rect::from_center_size(
+                    center,
+                    egui::vec2(fit_w * scale, fit_h * scale),
+                ));
+            }
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new("…")
@@ -1022,10 +1180,17 @@ impl SnapView {
                 counter.push_str(&format!("   ·   +{} RAW", sides.len()));
             }
         }
+        if self.hq_mode.load(Ordering::Relaxed) {
+            counter.push_str("   ·   HQ");
+        }
         let fav_count = self.favorites.len();
 
         let painter = ui.painter();
-        let rect = self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
+        let rect = if self.is_fullscreen {
+            ui.available_rect_before_wrap()
+        } else {
+            self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap())
+        };
 
         let text = format!("{}   ·   {}", name, counter);
         painter.text(
@@ -1112,7 +1277,11 @@ impl SnapView {
 
     fn render_nav_chevrons(&mut self, ui: &mut egui::Ui) {
         if self.images.is_empty() { return; }
-        let rect = self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
+        let rect = if self.is_fullscreen {
+            ui.available_rect_before_wrap()
+        } else {
+            self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap())
+        };
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let zone_w = 110.0;
         let btn_w = 36.0;
@@ -1244,6 +1413,13 @@ impl SnapView {
             if ui.button("Move to trash  (Delete)").clicked() { self.actions.delete = true; ui.close_menu(); }
             ui.separator();
             if ui.button("Toggle fullscreen  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
+            ui.separator();
+            let hq_label = if self.hq_mode.load(Ordering::Relaxed) {
+                "HQ mode  (Z)  [on]"
+            } else {
+                "HQ mode  (Z)"
+            };
+            if ui.button(hq_label).clicked() { self.actions.request_hq = true; ui.close_menu(); }
             ui.separator();
             if ui.button("About snapview…").clicked() { self.actions.show_about = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
@@ -1519,7 +1695,7 @@ fn is_jpeg(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::DynamicImage> {
+fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<(image::DynamicImage, Option<Vec<u8>>)> {
     let f = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(f);
     let mut decoder = jpeg_decoder::Decoder::new(reader);
@@ -1529,6 +1705,7 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::Dynamic
     let _ = decoder.scale(target, target);
     let pixels = decoder.decode().ok()?;
     let info = decoder.info()?;
+    let icc = decoder.icc_profile();
     let w = info.width as u32;
     let h = info.height as u32;
     let rgba: Vec<u8> = match info.pixel_format {
@@ -1557,17 +1734,68 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::Dynamic
         _ => return None,
     };
     let rgba_img = image::RgbaImage::from_raw(w, h, rgba)?;
-    Some(image::DynamicImage::ImageRgba8(rgba_img))
+    Some((image::DynamicImage::ImageRgba8(rgba_img), icc))
 }
 
-fn decode_image(path: &Path) -> (LoadedImage, i32) {
-    let (img, did_jpeg_scale) = if is_jpeg(path) {
-        match decode_jpeg_scaled(path, FULL_MAX_DIM) {
-            Some(i) => (Some(i), true),
-            None => (image::open(path).ok(), false),
+/// Open a non-JPEG via the image crate, returning the decoded DynamicImage
+/// alongside its embedded ICC profile (PNG iCCP, TIFF ICCProfile, etc).
+fn load_image_with_icc(path: &Path) -> Option<(image::DynamicImage, Option<Vec<u8>>)> {
+    use image::ImageDecoder;
+    let f = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(f);
+    let reader = image::ImageReader::new(reader).with_guessed_format().ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let img = image::DynamicImage::from_decoder(decoder).ok()?;
+    Some((img, icc))
+}
+
+/// Convert an RGBA buffer from its embedded ICC profile to sRGB in place.
+/// Returns true if a conversion was actually performed. The common case
+/// (sRGB or untagged) short-circuits to no-op.
+fn apply_icc_to_srgb(rgba: &mut [u8], icc_bytes: &[u8]) -> bool {
+    use lcms2::*;
+    let src = match Profile::new_icc(icc_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if let Some(desc) = src.info(InfoType::Description, Locale::none()) {
+        let d = desc.to_lowercase();
+        // sRGB and the various "untagged"/"display" aliases all map to our
+        // assumed output space — skip the per-pixel transform.
+        if d.contains("srgb") || d.contains("iec61966") {
+            return false;
+        }
+    }
+    let dst = Profile::new_srgb();
+    let transform = match Transform::new(
+        &src,
+        PixelFormat::RGBA_8,
+        &dst,
+        PixelFormat::RGBA_8,
+        Intent::Perceptual,
+    ) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    transform.transform_in_place(rgba);
+    true
+}
+
+fn decode_image_to(path: &Path, target_dim: u32) -> (LoadedImage, i32) {
+    let (img, did_jpeg_scale, icc) = if is_jpeg(path) {
+        match decode_jpeg_scaled(path, target_dim) {
+            Some((i, icc)) => (Some(i), true, icc),
+            None => {
+                let pair = load_image_with_icc(path);
+                let icc = pair.as_ref().and_then(|p| p.1.clone());
+                (pair.map(|p| p.0), false, icc)
+            }
         }
     } else {
-        (image::open(path).ok(), false)
+        let pair = load_image_with_icc(path);
+        let icc = pair.as_ref().and_then(|p| p.1.clone());
+        (pair.map(|p| p.0), false, icc)
     };
     let Some(mut img) = img else { return (LoadedImage::Failed, 0) };
     let orient = read_exif_orientation(path).unwrap_or(1);
@@ -1575,27 +1803,43 @@ fn decode_image(path: &Path) -> (LoadedImage, i32) {
     (img, display_quarter) = apply_exif_orientation_lazy(img, orient);
     if !did_jpeg_scale {
         let max_dim = img.width().max(img.height());
-        if max_dim > FULL_MAX_DIM {
-            img = img.resize(FULL_MAX_DIM, FULL_MAX_DIM, image::imageops::FilterType::Triangle);
+        if max_dim > target_dim {
+            img = img.resize(target_dim, target_dim, image::imageops::FilterType::Triangle);
         }
     }
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
-    let pixels = rgba.into_raw();
+    let mut pixels = rgba.into_raw();
+    if let Some(icc_bytes) = &icc {
+        apply_icc_to_srgb(&mut pixels, icc_bytes);
+    }
     let ci = color_image_from_rgba(size, pixels);
     (LoadedImage::Ready(Arc::new(ci)), display_quarter)
 }
 
 fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>, i32) {
+    // Fast path for JPEGs: lift the camera-embedded EXIF thumbnail (typically
+    // 160x120, 5-15 KB). Parsing + decoding it is ~5 ms; the GPU will upscale
+    // it to whatever the viewport wants. Yes, the result is blurry, but the
+    // user explicitly wants this "low-res but full size" preview tier.
     if is_jpeg(path) {
         if let Some(tup) = decode_jpeg_exif_thumb(path) {
             return tup;
         }
     }
-    let img = if is_jpeg(path) {
-        decode_jpeg_scaled(path, THUMB_MAX).or_else(|| image::open(path).ok())
+    let (img, icc) = if is_jpeg(path) {
+        match decode_jpeg_scaled(path, THUMB_MAX) {
+            Some((i, icc)) => (Some(i), icc),
+            None => {
+                let pair = load_image_with_icc(path);
+                let icc = pair.as_ref().and_then(|p| p.1.clone());
+                (pair.map(|p| p.0), icc)
+            }
+        }
     } else {
-        image::open(path).ok()
+        let pair = load_image_with_icc(path);
+        let icc = pair.as_ref().and_then(|p| p.1.clone());
+        (pair.map(|p| p.0), icc)
     };
     let Some(mut img) = img else { return (LoadedImage::Failed, None, 0) };
     let orient = read_exif_orientation(path).unwrap_or(1);
@@ -1605,15 +1849,17 @@ fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>, i32) {
     let small = img.thumbnail(THUMB_MAX, THUMB_MAX);
     let rgba = small.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
-    let pixels = rgba.into_raw();
+    let mut pixels = rgba.into_raw();
+    if let Some(icc_bytes) = &icc {
+        apply_icc_to_srgb(&mut pixels, icc_bytes);
+    }
     let ci = color_image_from_rgba(size, pixels);
     (LoadedImage::Ready(Arc::new(ci)), Some(full_dims), display_quarter)
 }
 
 /// Read the embedded thumbnail (typically 160x120, 5-15 KB) from a JPEG's
 /// EXIF APP1 segment. Cameras and phones embed this for instant preview;
-/// decoding it is ~5 ms vs hundreds of ms for the full image. Returns the
-/// usual decode_thumb tuple with display_quarter already folded.
+/// decoding it is ~5 ms vs ~100 ms for a scaled JPEG decode of a 20 MB file.
 fn decode_jpeg_exif_thumb(path: &Path) -> Option<(LoadedImage, Option<[usize; 2]>, i32)> {
     let (thumb_bytes, full_w, full_h, orient) = read_jpeg_exif_metadata(path)?;
     let thumb_bytes = thumb_bytes?;
@@ -1624,7 +1870,6 @@ fn decode_jpeg_exif_thumb(path: &Path) -> Option<(LoadedImage, Option<[usize; 2]
     let pixels = rgba.into_raw();
     let ci = color_image_from_rgba(size, pixels);
     let full_dims = if full_w > 0 && full_h > 0 {
-        // Post-EXIF dims: swap for rotation-only orientations.
         if (5..=8).contains(&orient) {
             Some([full_h as usize, full_w as usize])
         } else {
@@ -1636,16 +1881,15 @@ fn decode_jpeg_exif_thumb(path: &Path) -> Option<(LoadedImage, Option<[usize; 2]
     Some((LoadedImage::Ready(Arc::new(ci)), full_dims, display_quarter))
 }
 
-/// Minimal EXIF scanner: extracts (thumb_bytes?, full_width, full_height, orientation)
-/// without invoking a full EXIF library. Reads at most a few KB of header data
-/// before seeking directly to the thumbnail bytes.
+/// Minimal EXIF scanner: extracts (thumb_bytes?, full_width, full_height,
+/// orientation). Reads at most a few KB of header before seeking directly
+/// to the thumbnail bytes; doesn't depend on a full EXIF parser.
 fn read_jpeg_exif_metadata(path: &Path) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
     let mut soi = [0u8; 2];
     f.read_exact(&mut soi).ok()?;
     if soi != [0xFF, 0xD8] { return None; }
-    // Scan JPEG segments for APP1 (FFE1) containing "Exif\0\0".
     for _ in 0..32 {
         let mut marker = [0u8; 2];
         f.read_exact(&mut marker).ok()?;
@@ -1692,7 +1936,6 @@ fn parse_tiff_for_metadata(f: &mut std::fs::File) -> Option<(Option<Vec<u8>>, u3
         f.read_exact(&mut e).ok()?;
         let tag = r16(&e[0..2]);
         if tag == 0x0112 {
-            // Orientation is SHORT (type=3); first value stored in the low half of value field.
             orient = r16(&e[8..10]) as u32;
         }
     }
@@ -1768,6 +2011,19 @@ fn apply_exif_orientation_lazy(img: image::DynamicImage, orientation: u32) -> (i
     }
 }
 
+/// Texture options used for full-resolution image textures: bilinear
+/// minification + magnification, plus mipmaps so fit-to-window downscaling
+/// stays crisp without moire. Mipmaps cost ~33% extra texture memory and
+/// a one-shot generation on upload.
+fn full_texture_options() -> egui::TextureOptions {
+    egui::TextureOptions {
+        magnification: egui::TextureFilter::Linear,
+        minification: egui::TextureFilter::Linear,
+        wrap_mode: egui::TextureWrapMode::ClampToEdge,
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+    }
+}
+
 fn color_image_from_rgba(size: [usize; 2], rgba: Vec<u8>) -> egui::ColorImage {
     debug_assert_eq!(size[0] * size[1] * 4, rgba.len());
     let pixel_count = rgba.len() / 4;
@@ -1786,27 +2042,6 @@ fn color_image_from_rgba(size: [usize; 2], rgba: Vec<u8>) -> egui::ColorImage {
     }
     egui::ColorImage { size, pixels }
 }
-
-#[cfg(unix)]
-fn set_low_priority() {
-    unsafe { libc::nice(10); }
-}
-
-#[cfg(windows)]
-fn set_low_priority() {
-    use std::os::raw::c_int;
-    extern "system" {
-        fn GetCurrentThread() -> *mut std::ffi::c_void;
-        fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: c_int) -> i32;
-    }
-    const THREAD_PRIORITY_BELOW_NORMAL: c_int = -1;
-    unsafe {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn set_low_priority() {}
 
 fn load_app_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../assets/icon.png");
