@@ -1090,7 +1090,11 @@ impl SnapView {
         let fav_count = self.favorites.len();
 
         let painter = ui.painter();
-        let rect = self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
+        let rect = if self.is_fullscreen {
+            ui.available_rect_before_wrap()
+        } else {
+            self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap())
+        };
 
         let text = format!("{}   ·   {}", name, counter);
         painter.text(
@@ -1177,7 +1181,11 @@ impl SnapView {
 
     fn render_nav_chevrons(&mut self, ui: &mut egui::Ui) {
         if self.images.is_empty() { return; }
-        let rect = self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
+        let rect = if self.is_fullscreen {
+            ui.available_rect_before_wrap()
+        } else {
+            self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap())
+        };
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let zone_w = 110.0;
         let btn_w = 36.0;
