@@ -133,7 +133,6 @@ struct SnapView {
     is_fullscreen: bool,
     last_resized_path: Option<PathBuf>,
     last_aspect_class: Option<i8>,
-    resize_paint_skip: u8,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -141,6 +140,7 @@ struct SnapView {
 
     pending_delete: Option<PathBuf>,
     last_image_rect: Option<egui::Rect>,
+    displayed_path: Option<PathBuf>,
 
     zoom: f32,
     target_zoom: f32,
@@ -293,12 +293,12 @@ impl SnapView {
             is_fullscreen: false,
             last_resized_path: None,
             last_aspect_class: None,
-            resize_paint_skip: 0,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
             pending_delete: None,
             last_image_rect: None,
+            displayed_path: None,
             zoom: 1.0,
             target_zoom: 1.0,
             pan: egui::Vec2::ZERO,
@@ -361,6 +361,7 @@ impl SnapView {
         self.exif_quarter.clear();
         self.rotation.clear();
         self.zoom_hq_paths.lock().unwrap().clear();
+        self.displayed_path = None;
 
         self.thumb_q.clear();
         self.full_q.clear();
@@ -747,6 +748,12 @@ impl SnapView {
     fn maybe_resize_window_to_image(&mut self, ctx: &egui::Context) {
         let path = match self.current_path() { Some(p) => p, None => return };
         if self.last_resized_path.as_ref() == Some(&path) { return; }
+        // Only resize once the new image actually has something to render —
+        // otherwise the OS resizes the window before the new content lands
+        // and the user sees the desktop behind for a frame or two.
+        let new_ready = self.textures.contains_key(&path)
+            || self.thumb_textures.contains_key(&path);
+        if !new_ready { return; }
         let (iw, ih) = match self.display_dims(&path) { Some(d) => d, None => return };
         if iw == 0 || ih == 0 { return; }
         let aspect = iw as f32 / ih as f32;
@@ -771,7 +778,6 @@ impl SnapView {
         let new_y = outer.top();
 
         if (outer.width() - new_w).abs() < 2.0 {
-            // Nothing to resize; just remember the class.
             self.last_aspect_class = Some(class);
             self.last_resized_path = Some(path);
             return;
@@ -779,9 +785,6 @@ impl SnapView {
 
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(new_w, new_h)));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(new_x, new_y)));
-        // Skip painting for a couple of frames so the OS resize doesn't
-        // stretch the old image into the new bounds (visible as a flash).
-        self.resize_paint_skip = 2;
 
         self.last_aspect_class = Some(class);
         self.last_resized_path = Some(path);
@@ -969,35 +972,16 @@ impl eframe::App for SnapView {
             self.maybe_resize_window_to_image(ctx);
         }
         // During an OS resize the previous frame's content gets stretched into
-        // the new bounds, producing a visible flash. For a couple of frames
-        // after we send the resize command we paint nothing — the desktop /
-        // app behind shows through transparently instead.
-        let resizing = self.resize_paint_skip > 0;
-        if resizing {
-            self.resize_paint_skip -= 1;
-        }
-        let bg_alpha: u8 = if resizing {
-            0
-        } else if focused && !suppress_dim {
-            235
-        } else {
-            0
-        };
+        let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
-            if !resizing {
-                self.render_image(ui, ctx);
-                self.render_overlay(ui);
-                self.handle_background_interaction(ui, ctx);
-                self.render_close_button(ui);
-                self.render_nav_chevrons(ui);
-                self.handle_touch_swipe(ui);
-            } else {
-                // Keep continuous repaint requests flowing so we exit the
-                // skip-frames state promptly.
-                ctx.request_repaint();
-            }
+            self.render_image(ui, ctx);
+            self.render_overlay(ui);
+            self.handle_background_interaction(ui, ctx);
+            self.render_close_button(ui);
+            self.render_nav_chevrons(ui);
+            self.handle_touch_swipe(ui);
         });
 
         if self.show_filter {
@@ -1091,18 +1075,36 @@ impl SnapView {
 
         self.ensure_texture(ctx, &path);
 
-        let user_quarter = *self.rotation.get(&path).unwrap_or(&0);
-        let exif_q = *self.exif_quarter.get(&path).unwrap_or(&0);
+        // If the new image has no full or thumb yet, keep showing the
+        // previously displayed one so the screen never blanks during a
+        // navigation/resize transition.
+        let new_has_anything = self.textures.contains_key(&path)
+            || self.thumb_textures.contains_key(&path);
+        let draw_path: PathBuf = if new_has_anything {
+            self.displayed_path = Some(path.clone());
+            path.clone()
+        } else if let Some(prev) = self.displayed_path.clone() {
+            if self.textures.contains_key(&prev) || self.thumb_textures.contains_key(&prev) {
+                prev
+            } else {
+                path.clone()
+            }
+        } else {
+            path.clone()
+        };
+
+        let user_quarter = *self.rotation.get(&draw_path).unwrap_or(&0);
+        let exif_q = *self.exif_quarter.get(&draw_path).unwrap_or(&0);
         let rotation_quarter = (user_quarter + exif_q).rem_euclid(4);
 
-        let full_tex = self.textures.get(&path).cloned();
-        let tex_opt = full_tex.clone().or_else(|| self.thumb_textures.get(&path).cloned());
+        let full_tex = self.textures.get(&draw_path).cloned();
+        let tex_opt = full_tex.clone().or_else(|| self.thumb_textures.get(&draw_path).cloned());
 
         if let Some(tex) = tex_opt {
             // Prefer full texture's own size; otherwise use stored full dims; finally fall back to texture size.
             let img_size = if let Some(t) = &full_tex {
                 t.size_vec2()
-            } else if let Some(d) = self.full_dims.get(&path) {
+            } else if let Some(d) = self.full_dims.get(&draw_path) {
                 egui::vec2(d[0] as f32, d[1] as f32)
             } else {
                 tex.size_vec2()
@@ -1138,7 +1140,7 @@ impl SnapView {
             // No texture yet, but keep last_image_rect in sync with the
             // image's known aspect so overlays/chevrons sit in the right
             // place during the brief decode window.
-            if let Some((w, h)) = self.display_dims(&path) {
+            if let Some((w, h)) = self.display_dims(&draw_path) {
                 let fit_w = w as f32;
                 let fit_h = h as f32;
                 let base_scale = (avail.x / fit_w).min(avail.y / fit_h).min(1.0).max(0.01);
@@ -1884,37 +1886,66 @@ fn decode_jpeg_exif_thumb(path: &Path) -> Option<(LoadedImage, Option<[usize; 2]
 /// Minimal EXIF scanner: extracts (thumb_bytes?, full_width, full_height,
 /// orientation). Reads at most a few KB of header before seeking directly
 /// to the thumbnail bytes; doesn't depend on a full EXIF parser.
+/// Minimal EXIF + JPEG SOF scanner: extracts (thumb_bytes?, image_width,
+/// image_height, orientation). The width/height come from the JPEG's SOFn
+/// frame header (always present) rather than EXIF IFD0's ImageWidth/Length
+/// tags, which many encoders simply omit.
 fn read_jpeg_exif_metadata(path: &Path) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
     let mut soi = [0u8; 2];
     f.read_exact(&mut soi).ok()?;
     if soi != [0xFF, 0xD8] { return None; }
-    for _ in 0..32 {
+
+    let mut exif: Option<(Option<Vec<u8>>, u32, u32, u32)> = None;
+    let mut sof: Option<(u32, u32)> = None;
+
+    for _ in 0..64 {
         let mut marker = [0u8; 2];
-        f.read_exact(&mut marker).ok()?;
-        if marker[0] != 0xFF { return None; }
-        if matches!(marker[1], 0xD9 | 0xDA) { return None; }
+        if f.read_exact(&mut marker).is_err() { break; }
+        if marker[0] != 0xFF { break; }
+        if matches!(marker[1], 0xD9 | 0xDA) { break; }
         let mut len_bytes = [0u8; 2];
-        f.read_exact(&mut len_bytes).ok()?;
+        if f.read_exact(&mut len_bytes).is_err() { break; }
         let seg_len = u16::from_be_bytes(len_bytes) as u64;
         let seg_data_start = f.stream_position().ok()?;
-        if marker[1] == 0xE1 {
+        let m = marker[1];
+
+        // SOFn family (frame header). Excludes DHT (C4), JPG (C8), DAC (CC).
+        if (0xC0..=0xCF).contains(&m) && m != 0xC4 && m != 0xC8 && m != 0xCC {
+            let mut frame = [0u8; 5];
+            if f.read_exact(&mut frame).is_ok() {
+                let h = u16::from_be_bytes([frame[1], frame[2]]) as u32;
+                let w = u16::from_be_bytes([frame[3], frame[4]]) as u32;
+                sof = Some((w, h));
+            }
+            f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+        } else if m == 0xE1 && exif.is_none() {
             let mut id = [0u8; 6];
             if f.read_exact(&mut id).is_err() {
                 f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
                 continue;
             }
             if &id == b"Exif\0\0" {
-                return parse_tiff_for_metadata(&mut f);
+                exif = parse_tiff_for_metadata(&mut f);
+                let _ = f.seek(SeekFrom::Start(seg_data_start + seg_len - 2));
             } else {
                 f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
             }
         } else {
             f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
         }
+        if exif.is_some() && sof.is_some() { break; }
     }
-    None
+
+    let (thumb, ew, eh, orient) = exif.unwrap_or((None, 0, 0, 1));
+    let (w, h) = match (sof, (ew != 0 && eh != 0).then_some((ew, eh))) {
+        (Some(s), _) => s,
+        (None, Some(e)) => e,
+        _ => (0, 0),
+    };
+    if w == 0 && h == 0 && thumb.is_none() { return None; }
+    Some((thumb, w, h, orient))
 }
 
 fn parse_tiff_for_metadata(f: &mut std::fs::File) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
