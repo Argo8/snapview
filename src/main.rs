@@ -123,6 +123,7 @@ struct SnapView {
     full_q: Arc<PrioQueue>,
     thumb_q: Arc<PrioQueue>,
     hq_mode: Arc<AtomicBool>,
+    zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>>,
     result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
@@ -234,6 +235,7 @@ impl SnapView {
         let full_q = PrioQueue::new();
         let thumb_q = PrioQueue::new();
         let hq_mode = Arc::new(AtomicBool::new(false));
+        let zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let total = num_workers();
         let n_full = (total / 2).max(2);
@@ -244,9 +246,12 @@ impl SnapView {
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
             let hq = Arc::clone(&hq_mode);
+            let zoom_hq = Arc::clone(&zoom_hq_paths);
             thread::spawn(move || loop {
                 let path = match q.pop() { Some(p) => p, None => break };
-                let target = if hq.load(Ordering::Relaxed) { HQ_MAX_DIM } else { FULL_MAX_DIM };
+                let need_hq = hq.load(Ordering::Relaxed)
+                    || zoom_hq.lock().unwrap().contains(&path);
+                let target = if need_hq { HQ_MAX_DIM } else { FULL_MAX_DIM };
                 let (r, q) = decode_image_to(&path, target);
                 let _ = tx.send(JobResult::Full(path, r, q));
                 ctx.request_repaint();
@@ -280,6 +285,7 @@ impl SnapView {
             full_q,
             thumb_q,
             hq_mode,
+            zoom_hq_paths,
             result_rx,
             show_filter: false,
             show_about: false,
@@ -354,6 +360,7 @@ impl SnapView {
         self.full_dims.clear();
         self.exif_quarter.clear();
         self.rotation.clear();
+        self.zoom_hq_paths.lock().unwrap().clear();
 
         self.thumb_q.clear();
         self.full_q.clear();
@@ -698,6 +705,21 @@ impl SnapView {
         self.target_zoom = new_target;
         if self.target_zoom <= 1.0001 {
             self.target_pan = egui::Vec2::ZERO;
+        }
+        // First zoom past ~1.05 on the current image promotes it to a native
+        // re-decode in the background, so the pixels stay crisp at any zoom
+        // factor. Once promoted, it stays HQ for this session (we don't
+        // downgrade on zoom out — re-decoding is the expensive part).
+        if self.target_zoom > 1.05 {
+            if let Some(p) = self.current_path() {
+                let mut set = self.zoom_hq_paths.lock().unwrap();
+                if set.insert(p.clone()) {
+                    drop(set);
+                    self.cache.lock().unwrap().remove(&p);
+                    self.textures.remove(&p);
+                    self.full_q.prioritize(&[p]);
+                }
+            }
         }
         ctx.request_repaint();
     }
