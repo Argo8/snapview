@@ -9,11 +9,13 @@ use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
 const THUMB_MAX: u32 = 768;
-/// Target dimension for the full-resolution decode. 2400 covers 1440p
-/// displays at 1:1 and leaves headroom for zoom; for JPEGs the decoder
-/// picks the closest native DCT scale that's >= this value (so 4000-8000 px
-/// camera shots decode at 2000-4000 px in ~60-120 ms instead of seconds).
+/// Default target dimension for the full-resolution decode. 2400 covers
+/// 1440p displays at 1:1 and leaves headroom for zoom; for JPEGs the
+/// decoder picks the closest native DCT scale that's >= this value (so
+/// 4000-8000 px camera shots decode at 2000-4000 px in ~60-120 ms).
 const FULL_MAX_DIM: u32 = 2400;
+/// Target for the on-demand high-quality re-decode (triggered with Z).
+const HQ_MAX_DIM: u32 = 16384;
 const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
     "rw2", "pef", "ptx", "srw", "dng", "raw", "rwl", "3fr", "fff", "erf",
@@ -74,6 +76,7 @@ struct PendingActions {
     confirm_delete: bool,
     cancel_delete: bool,
     show_about: bool,
+    request_hq: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,6 +121,8 @@ struct SnapView {
 
     full_q: Arc<PrioQueue>,
     thumb_q: Arc<PrioQueue>,
+    hq_q: Arc<PrioQueue>,
+    hq_requested: HashSet<PathBuf>,
     result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
@@ -155,6 +160,7 @@ struct TouchSwipe {
 enum JobResult {
     Full(PathBuf, LoadedImage, i32),
     Thumb(PathBuf, LoadedImage, Option<[usize; 2]>, i32),
+    Hq(PathBuf, LoadedImage, i32),
 }
 
 struct PrioQueueInner {
@@ -227,6 +233,7 @@ impl SnapView {
         let (result_tx, result_rx) = mpsc::channel::<JobResult>();
         let full_q = PrioQueue::new();
         let thumb_q = PrioQueue::new();
+        let hq_q = PrioQueue::new();
 
         let total = num_workers();
         let n_full = (total / 2).max(2);
@@ -257,6 +264,18 @@ impl SnapView {
                 }
             });
         }
+        {
+            // Dedicated single worker for high-quality (Z) re-decodes.
+            let q = Arc::clone(&hq_q);
+            let tx = result_tx.clone();
+            let ctx = cc.egui_ctx.clone();
+            thread::spawn(move || loop {
+                let path = match q.pop() { Some(p) => p, None => break };
+                let (r, qrt) = decode_image_hq(&path);
+                let _ = tx.send(JobResult::Hq(path, r, qrt));
+                ctx.request_repaint();
+            });
+        }
 
         let mut app = Self {
             images: Vec::new(),
@@ -273,6 +292,8 @@ impl SnapView {
             exif_quarter: HashMap::new(),
             full_q,
             thumb_q,
+            hq_q,
+            hq_requested: HashSet::new(),
             result_rx,
             show_filter: false,
             show_about: false,
@@ -349,6 +370,8 @@ impl SnapView {
 
         self.thumb_q.clear();
         self.full_q.clear();
+        self.hq_q.clear();
+        self.hq_requested.clear();
 
         let n = self.images.len();
         let cur = if let Some(sel) = &select {
@@ -432,6 +455,10 @@ impl SnapView {
                     cache.insert(path.clone(), result.clone());
                     drop(cache);
                     if let LoadedImage::Ready(ci) = result {
+                        // Don't downgrade an HQ texture with a normal one.
+                        let existing_w = self.textures.get(&path).map(|t| t.size_vec2().x as usize);
+                        let incoming_w = ci.size[0];
+                        let would_downgrade = existing_w.map(|w| incoming_w + 4 < w).unwrap_or(false);
                         // Skip GPU upload for results that have drifted far from
                         // current — keep in cache (cheap), upload only if/when
                         // the user navigates back.
@@ -441,7 +468,7 @@ impl SnapView {
                             .position(|p| p == &path)
                             .map(|i| (i as isize - self.current as isize).unsigned_abs() <= TEXTURE_CACHE_MAX / 2)
                             .unwrap_or(true);
-                        if upload {
+                        if upload && !would_downgrade {
                             let tex = ctx.load_texture(
                                 path.to_string_lossy().to_string(),
                                 (*ci).clone(),
@@ -449,6 +476,20 @@ impl SnapView {
                             );
                             self.textures.insert(path, tex);
                         }
+                    }
+                }
+                JobResult::Hq(path, result, exif_q) => {
+                    self.exif_quarter.insert(path.clone(), exif_q);
+                    let mut cache = self.cache.lock().unwrap();
+                    cache.insert(path.clone(), result.clone());
+                    drop(cache);
+                    if let LoadedImage::Ready(ci) = result {
+                        let tex = ctx.load_texture(
+                            format!("hq:{}", path.to_string_lossy()),
+                            (*ci).clone(),
+                            full_texture_options(),
+                        );
+                        self.textures.insert(path, tex);
                     }
                 }
                 JobResult::Thumb(path, result, dims, exif_q) => {
@@ -897,6 +938,7 @@ impl eframe::App for SnapView {
                 if i.key_pressed(egui::Key::Q) { self.actions.rot_left = true; }
                 if i.key_pressed(egui::Key::W) { self.actions.rot_right = true; }
                 if i.key_pressed(egui::Key::Space) { self.actions.toggle_fav = true; }
+                if i.key_pressed(egui::Key::Z) { self.actions.request_hq = true; }
                 if i.key_pressed(egui::Key::F) {
                     if i.modifiers.shift { self.actions.open_filter = true; }
                     else { self.actions.cycle_filter = true; }
@@ -989,6 +1031,14 @@ impl eframe::App for SnapView {
         if actions.confirm_delete { self.confirm_delete(); }
         if actions.cancel_delete { self.pending_delete = None; }
         if actions.show_about { self.show_about = true; }
+        if actions.request_hq {
+            if let Some(p) = self.current_path() {
+                if self.hq_requested.insert(p.clone()) {
+                    self.hq_q.prioritize(&[p]);
+                    self.filter_msg = Some(("HQ decode…".to_string(), 1.2));
+                }
+            }
+        }
 
         // Decay transient filter message
         if let Some((_, ref mut t)) = self.filter_msg {
@@ -1110,6 +1160,9 @@ impl SnapView {
             if !sides.is_empty() {
                 counter.push_str(&format!("   ·   +{} RAW", sides.len()));
             }
+        }
+        if self.hq_requested.contains(&path) {
+            counter.push_str("   ·   HQ");
         }
         let fav_count = self.favorites.len();
 
@@ -1341,6 +1394,13 @@ impl SnapView {
             if ui.button("Move to trash  (Delete)").clicked() { self.actions.delete = true; ui.close_menu(); }
             ui.separator();
             if ui.button("Toggle fullscreen  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
+            ui.separator();
+            let hq_label = if self.current_path().map(|p| self.hq_requested.contains(&p)).unwrap_or(false) {
+                "High-quality re-decode  (Z)  [active]"
+            } else {
+                "High-quality re-decode  (Z)"
+            };
+            if ui.button(hq_label).clicked() { self.actions.request_hq = true; ui.close_menu(); }
             ui.separator();
             if ui.button("About snapview…").clicked() { self.actions.show_about = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
@@ -1704,8 +1764,16 @@ fn apply_icc_to_srgb(rgba: &mut [u8], icc_bytes: &[u8]) -> bool {
 }
 
 fn decode_image(path: &Path) -> (LoadedImage, i32) {
+    decode_image_to(path, FULL_MAX_DIM)
+}
+
+fn decode_image_hq(path: &Path) -> (LoadedImage, i32) {
+    decode_image_to(path, HQ_MAX_DIM)
+}
+
+fn decode_image_to(path: &Path, target_dim: u32) -> (LoadedImage, i32) {
     let (img, did_jpeg_scale, icc) = if is_jpeg(path) {
-        match decode_jpeg_scaled(path, FULL_MAX_DIM) {
+        match decode_jpeg_scaled(path, target_dim) {
             Some((i, icc)) => (Some(i), true, icc),
             None => {
                 let pair = load_image_with_icc(path);
@@ -1724,8 +1792,8 @@ fn decode_image(path: &Path) -> (LoadedImage, i32) {
     (img, display_quarter) = apply_exif_orientation_lazy(img, orient);
     if !did_jpeg_scale {
         let max_dim = img.width().max(img.height());
-        if max_dim > FULL_MAX_DIM {
-            img = img.resize(FULL_MAX_DIM, FULL_MAX_DIM, image::imageops::FilterType::Triangle);
+        if max_dim > target_dim {
+            img = img.resize(target_dim, target_dim, image::imageops::FilterType::Triangle);
         }
     }
     let rgba = img.to_rgba8();
