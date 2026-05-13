@@ -3,6 +3,7 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -121,8 +122,7 @@ struct SnapView {
 
     full_q: Arc<PrioQueue>,
     thumb_q: Arc<PrioQueue>,
-    hq_q: Arc<PrioQueue>,
-    hq_requested: HashSet<PathBuf>,
+    hq_mode: Arc<AtomicBool>,
     result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
@@ -161,7 +161,6 @@ struct TouchSwipe {
 enum JobResult {
     Full(PathBuf, LoadedImage, i32),
     Thumb(PathBuf, LoadedImage, Option<[usize; 2]>, i32),
-    Hq(PathBuf, LoadedImage, i32),
 }
 
 struct PrioQueueInner {
@@ -234,7 +233,7 @@ impl SnapView {
         let (result_tx, result_rx) = mpsc::channel::<JobResult>();
         let full_q = PrioQueue::new();
         let thumb_q = PrioQueue::new();
-        let hq_q = PrioQueue::new();
+        let hq_mode = Arc::new(AtomicBool::new(false));
 
         let total = num_workers();
         let n_full = (total / 2).max(2);
@@ -244,9 +243,11 @@ impl SnapView {
             let q = Arc::clone(&full_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
+            let hq = Arc::clone(&hq_mode);
             thread::spawn(move || loop {
                 let path = match q.pop() { Some(p) => p, None => break };
-                let (r, q) = decode_image(&path);
+                let target = if hq.load(Ordering::Relaxed) { HQ_MAX_DIM } else { FULL_MAX_DIM };
+                let (r, q) = decode_image_to(&path, target);
                 let _ = tx.send(JobResult::Full(path, r, q));
                 ctx.request_repaint();
             });
@@ -259,18 +260,6 @@ impl SnapView {
                 let path = match q.pop() { Some(p) => p, None => break };
                 let (r, dims, qrt) = decode_thumb(&path);
                 let _ = tx.send(JobResult::Thumb(path, r, dims, qrt));
-                ctx.request_repaint();
-            });
-        }
-        {
-            // Dedicated single worker for high-quality (Z) re-decodes.
-            let q = Arc::clone(&hq_q);
-            let tx = result_tx.clone();
-            let ctx = cc.egui_ctx.clone();
-            thread::spawn(move || loop {
-                let path = match q.pop() { Some(p) => p, None => break };
-                let (r, qrt) = decode_image_hq(&path);
-                let _ = tx.send(JobResult::Hq(path, r, qrt));
                 ctx.request_repaint();
             });
         }
@@ -290,8 +279,7 @@ impl SnapView {
             exif_quarter: HashMap::new(),
             full_q,
             thumb_q,
-            hq_q,
-            hq_requested: HashSet::new(),
+            hq_mode,
             result_rx,
             show_filter: false,
             show_about: false,
@@ -369,8 +357,6 @@ impl SnapView {
 
         self.thumb_q.clear();
         self.full_q.clear();
-        self.hq_q.clear();
-        self.hq_requested.clear();
 
         let n = self.images.len();
         let cur = if let Some(sel) = &select {
@@ -454,10 +440,6 @@ impl SnapView {
                     cache.insert(path.clone(), result.clone());
                     drop(cache);
                     if let LoadedImage::Ready(ci) = result {
-                        // Don't downgrade an HQ texture with a normal one.
-                        let existing_w = self.textures.get(&path).map(|t| t.size_vec2().x as usize);
-                        let incoming_w = ci.size[0];
-                        let would_downgrade = existing_w.map(|w| incoming_w + 4 < w).unwrap_or(false);
                         // Skip GPU upload for results that have drifted far from
                         // current — keep in cache (cheap), upload only if/when
                         // the user navigates back.
@@ -467,7 +449,7 @@ impl SnapView {
                             .position(|p| p == &path)
                             .map(|i| (i as isize - self.current as isize).unsigned_abs() <= TEXTURE_CACHE_MAX / 2)
                             .unwrap_or(true);
-                        if upload && !would_downgrade {
+                        if upload {
                             let tex = ctx.load_texture(
                                 path.to_string_lossy().to_string(),
                                 (*ci).clone(),
@@ -475,20 +457,6 @@ impl SnapView {
                             );
                             self.textures.insert(path, tex);
                         }
-                    }
-                }
-                JobResult::Hq(path, result, exif_q) => {
-                    self.exif_quarter.insert(path.clone(), exif_q);
-                    let mut cache = self.cache.lock().unwrap();
-                    cache.insert(path.clone(), result.clone());
-                    drop(cache);
-                    if let LoadedImage::Ready(ci) = result {
-                        let tex = ctx.load_texture(
-                            format!("hq:{}", path.to_string_lossy()),
-                            (*ci).clone(),
-                            full_texture_options(),
-                        );
-                        self.textures.insert(path, tex);
                     }
                 }
                 JobResult::Thumb(path, result, dims, exif_q) => {
@@ -1054,20 +1022,19 @@ impl eframe::App for SnapView {
         if actions.cancel_delete { self.pending_delete = None; }
         if actions.show_about { self.show_about = true; }
         if actions.request_hq {
-            if let Some(p) = self.current_path() {
-                if self.hq_requested.contains(&p) {
-                    // Toggle off: drop HQ texture and re-queue the snappy full.
-                    self.hq_requested.remove(&p);
-                    self.cache.lock().unwrap().remove(&p);
-                    self.textures.remove(&p);
-                    self.full_q.prioritize(&[p]);
-                    self.filter_msg = Some(("HQ off".to_string(), 1.0));
-                } else {
-                    self.hq_requested.insert(p.clone());
-                    self.hq_q.prioritize(&[p]);
-                    self.filter_msg = Some(("HQ decode…".to_string(), 1.2));
-                }
-            }
+            // Global HQ mode toggle: when on, all subsequent decodes target
+            // native resolution. Existing cached/uploaded textures are
+            // discarded so the active image gets re-decoded at the new tier.
+            let new_mode = !self.hq_mode.load(Ordering::Relaxed);
+            self.hq_mode.store(new_mode, Ordering::Relaxed);
+            self.cache.lock().unwrap().clear();
+            self.textures.clear();
+            self.full_q.clear();
+            self.queue_preload();
+            self.filter_msg = Some((
+                if new_mode { "HQ mode" } else { "Snappy mode" }.to_string(),
+                1.2,
+            ));
         }
 
         // Decay transient filter message
@@ -1191,7 +1158,7 @@ impl SnapView {
                 counter.push_str(&format!("   ·   +{} RAW", sides.len()));
             }
         }
-        if self.hq_requested.contains(&path) {
+        if self.hq_mode.load(Ordering::Relaxed) {
             counter.push_str("   ·   HQ");
         }
         let fav_count = self.favorites.len();
@@ -1425,10 +1392,10 @@ impl SnapView {
             ui.separator();
             if ui.button("Toggle fullscreen  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
             ui.separator();
-            let hq_label = if self.current_path().map(|p| self.hq_requested.contains(&p)).unwrap_or(false) {
-                "High-quality re-decode  (Z)  [active]"
+            let hq_label = if self.hq_mode.load(Ordering::Relaxed) {
+                "HQ mode  (Z)  [on]"
             } else {
-                "High-quality re-decode  (Z)"
+                "HQ mode  (Z)"
             };
             if ui.button(hq_label).clicked() { self.actions.request_hq = true; ui.close_menu(); }
             ui.separator();
@@ -1791,14 +1758,6 @@ fn apply_icc_to_srgb(rgba: &mut [u8], icc_bytes: &[u8]) -> bool {
     };
     transform.transform_in_place(rgba);
     true
-}
-
-fn decode_image(path: &Path) -> (LoadedImage, i32) {
-    decode_image_to(path, FULL_MAX_DIM)
-}
-
-fn decode_image_hq(path: &Path) -> (LoadedImage, i32) {
-    decode_image_to(path, HQ_MAX_DIM)
 }
 
 fn decode_image_to(path: &Path, target_dim: u32) -> (LoadedImage, i32) {
