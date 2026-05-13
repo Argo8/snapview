@@ -9,7 +9,11 @@ use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
 const THUMB_MAX: u32 = 768;
-const FULL_MAX_DIM: u32 = 2400;
+/// Ultimate safety cap for the full-resolution decode. Anything below this
+/// is decoded at native resolution (no quality loss). 16384 covers GigaPixel
+/// territory; above that we resort to a Triangle downscale to keep texture
+/// memory sane.
+const FULL_MAX_DIM: u32 = 16384;
 const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
     "rw2", "pef", "ptx", "srw", "dng", "raw", "rwl", "3fr", "fff", "erf",
@@ -19,7 +23,11 @@ const RAW_EXTS: &[&str] = &[
 ];
 const FAVORITES_FILE: &str = ".favorites.txt";
 const PRELOAD_RADIUS: usize = 3;
-const TEXTURE_CACHE_MAX: usize = 60;
+/// How many full-resolution textures we keep uploaded on the GPU. At native
+/// resolution a 24 MP shot is ~96 MB and a 50 MP shot ~192 MB, so we keep
+/// this conservative; revisits are cheap because the CPU-side ColorImage
+/// cache (self.cache) is unbounded and a re-upload to the GPU is fast.
+const TEXTURE_CACHE_MAX: usize = 24;
 
 fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = std::env::args().collect();
@@ -439,7 +447,7 @@ impl SnapView {
                             let tex = ctx.load_texture(
                                 path.to_string_lossy().to_string(),
                                 (*ci).clone(),
-                                egui::TextureOptions::LINEAR,
+                                full_texture_options(),
                             );
                             self.textures.insert(path, tex);
                         }
@@ -492,7 +500,7 @@ impl SnapView {
             let tex = ctx.load_texture(
                 path.to_string_lossy().to_string(),
                 (*ci).clone(),
-                egui::TextureOptions::LINEAR,
+                full_texture_options(),
             );
             self.textures.insert(path.to_path_buf(), tex);
         }
@@ -1708,6 +1716,19 @@ fn apply_exif_orientation_lazy(img: image::DynamicImage, orientation: u32) -> (i
             (DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&r)), 0)
         }
         _ => (img, 0),
+    }
+}
+
+/// Texture options used for full-resolution image textures: bilinear
+/// minification + magnification, plus mipmaps so fit-to-window downscaling
+/// stays crisp without moire. Mipmaps cost ~33% extra texture memory and
+/// a one-shot generation on upload.
+fn full_texture_options() -> egui::TextureOptions {
+    egui::TextureOptions {
+        magnification: egui::TextureFilter::Linear,
+        minification: egui::TextureFilter::Linear,
+        wrap_mode: egui::TextureWrapMode::ClampToEdge,
+        mipmap_mode: Some(egui::TextureFilter::Linear),
     }
 }
 
