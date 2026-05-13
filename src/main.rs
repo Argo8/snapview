@@ -1944,43 +1944,69 @@ fn read_jpeg_exif_metadata(path: &Path) -> Option<(Option<Vec<u8>>, u32, u32, u3
     let mut sof: Option<(u32, u32)> = None;
 
     for _ in 0..64 {
-        let mut marker = [0u8; 2];
-        if f.read_exact(&mut marker).is_err() { break; }
-        if marker[0] != 0xFF { break; }
-        if matches!(marker[1], 0xD9 | 0xDA) { break; }
+        // A marker is 0xFF followed by a non-zero / non-0xFF byte; encoders
+        // may emit any number of 0xFF fill bytes between segments. Walk past
+        // them and any stray non-marker bytes (corruption resilience).
+        let mut b = [0u8; 1];
+        if f.read_exact(&mut b).is_err() { break; }
+        if b[0] != 0xFF { continue; }
+        let m = loop {
+            let mut x = [0u8; 1];
+            if f.read_exact(&mut x).is_err() { return finalize(exif, sof); }
+            if x[0] != 0xFF { break x[0]; }
+        };
+        // SOI/EOI/RSTn/TEM are standalone (no length, no payload).
+        if m == 0x00 || m == 0xD8 || m == 0xD9 || m == 0x01 || (0xD0..=0xD7).contains(&m) {
+            if m == 0xD9 { break; } // EOI
+            continue;
+        }
+        // SOS (Start of Scan): compressed entropy data follows; we'd have to
+        // scan for the next non-stuffed 0xFFxx marker. Anything we care about
+        // appears before SOS, so just stop.
+        if m == 0xDA { break; }
         let mut len_bytes = [0u8; 2];
         if f.read_exact(&mut len_bytes).is_err() { break; }
         let seg_len = u16::from_be_bytes(len_bytes) as u64;
+        // A valid length is >= 2 (it includes the two length bytes themselves).
+        if seg_len < 2 { break; }
+        let payload_len = seg_len - 2;
         let seg_data_start = f.stream_position().ok()?;
-        let m = marker[1];
+        let seg_end = seg_data_start + payload_len;
 
         // SOFn family (frame header). Excludes DHT (C4), JPG (C8), DAC (CC).
         if (0xC0..=0xCF).contains(&m) && m != 0xC4 && m != 0xC8 && m != 0xCC {
             let mut frame = [0u8; 5];
-            if f.read_exact(&mut frame).is_ok() {
+            if payload_len >= 5 && f.read_exact(&mut frame).is_ok() {
                 let h = u16::from_be_bytes([frame[1], frame[2]]) as u32;
                 let w = u16::from_be_bytes([frame[3], frame[4]]) as u32;
                 sof = Some((w, h));
             }
-            f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+            f.seek(SeekFrom::Start(seg_end)).ok()?;
         } else if m == 0xE1 && exif.is_none() {
             let mut id = [0u8; 6];
-            if f.read_exact(&mut id).is_err() {
-                f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+            if payload_len < 6 || f.read_exact(&mut id).is_err() {
+                f.seek(SeekFrom::Start(seg_end)).ok()?;
                 continue;
             }
             if &id == b"Exif\0\0" {
                 exif = parse_tiff_for_metadata(&mut f);
-                let _ = f.seek(SeekFrom::Start(seg_data_start + seg_len - 2));
+                let _ = f.seek(SeekFrom::Start(seg_end));
             } else {
-                f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+                f.seek(SeekFrom::Start(seg_end)).ok()?;
             }
         } else {
-            f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+            f.seek(SeekFrom::Start(seg_end)).ok()?;
         }
         if exif.is_some() && sof.is_some() { break; }
     }
 
+    finalize(exif, sof)
+}
+
+fn finalize(
+    exif: Option<(Option<Vec<u8>>, u32, u32, u32)>,
+    sof: Option<(u32, u32)>,
+) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
     let (thumb, ew, eh, orient) = exif.unwrap_or((None, 0, 0, 1));
     let (w, h) = match (sof, (ew != 0 && eh != 0).then_some((ew, eh))) {
         (Some(s), _) => s,
