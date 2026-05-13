@@ -121,6 +121,7 @@ struct SnapView {
     filter_selected: HashSet<PathBuf>,
 
     is_fullscreen: bool,
+    last_resized_path: Option<PathBuf>,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -272,6 +273,7 @@ impl SnapView {
             show_about: false,
             filter_selected: HashSet::new(),
             is_fullscreen: false,
+            last_resized_path: None,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
@@ -701,16 +703,60 @@ impl SnapView {
         true
     }
 
+    /// When windowed, shrink/grow the window so its inner area matches the
+    /// image's aspect ratio. Height is left alone (so the user's preferred
+    /// vertical size is preserved); only width is adjusted. We do this once
+    /// per image change to avoid re-firing the OS resize every frame.
+    fn maybe_resize_window_to_image(&mut self, ctx: &egui::Context) {
+        let path = match self.current_path() { Some(p) => p, None => return };
+        if self.last_resized_path.as_ref() == Some(&path) { return; }
+        let (iw, ih) = match self.display_dims(&path) { Some(d) => d, None => return };
+        if iw == 0 || ih == 0 { return; }
+        let cur = ctx.screen_rect().size();
+        // Use the longer screen-side as the reference so portrait↔landscape
+        // transitions are visually balanced (window doesn't shrink to a strip).
+        let reference = cur.x.max(cur.y).max(400.0);
+        let aspect = iw as f32 / ih as f32;
+        let (new_w, new_h) = if aspect >= 1.0 {
+            (reference, reference / aspect)
+        } else {
+            (reference * aspect, reference)
+        };
+        // Avoid spurious resizes when already within a pixel.
+        if (cur.x - new_w).abs() < 2.0 && (cur.y - new_h).abs() < 2.0 {
+            self.last_resized_path = Some(path);
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(new_w, new_h)));
+        self.last_resized_path = Some(path);
+    }
+
     fn current_is_portrait(&self) -> bool {
         let path = match self.current_path() { Some(p) => p, None => return false };
-        let cache = self.cache.lock().unwrap();
-        if let Some(LoadedImage::Ready(ci)) = cache.get(&path) {
-            let rot = *self.rotation.get(&path).unwrap_or(&0);
-            let (w, h) = (ci.size[0], ci.size[1]);
-            let (w, h) = if rot.rem_euclid(2) == 0 { (w, h) } else { (h, w) };
-            return h > w;
-        }
-        false
+        let (w, h) = match self.display_dims(&path) {
+            Some(d) => d,
+            None => return false,
+        };
+        h > w
+    }
+
+    /// Returns the on-screen (post-rotation) dimensions of the image, using
+    /// any cached info available — full cache, thumb full_dims, or the texture
+    /// itself. EXIF and user rotation both factored in.
+    fn display_dims(&self, path: &Path) -> Option<(usize, usize)> {
+        let raw = if let Some(LoadedImage::Ready(ci)) = self.cache.lock().unwrap().get(path) {
+            Some((ci.size[0], ci.size[1]))
+        } else if let Some(d) = self.full_dims.get(path) {
+            Some((d[0], d[1]))
+        } else if let Some(tex) = self.textures.get(path).or_else(|| self.thumb_textures.get(path)) {
+            let s = tex.size_vec2();
+            Some((s.x as usize, s.y as usize))
+        } else {
+            None
+        }?;
+        let rot = self.rotation.get(path).copied().unwrap_or(0)
+            + self.exif_quarter.get(path).copied().unwrap_or(0);
+        if rot.rem_euclid(2) == 0 { Some(raw) } else { Some((raw.1, raw.0)) }
     }
 
     fn copy_filtered(&self, dest: &Path) -> std::io::Result<(usize, usize)> {
@@ -863,6 +909,9 @@ impl eframe::App for SnapView {
         let portrait = self.current_is_portrait();
         let suppress_dim = portrait && !self.is_fullscreen && self.target_zoom <= 1.001;
         let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
+        if !self.is_fullscreen {
+            self.maybe_resize_window_to_image(ctx);
+        }
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
@@ -908,6 +957,8 @@ impl eframe::App for SnapView {
         if actions.toggle_max {
             self.is_fullscreen = !self.is_fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+            // Re-evaluate window sizing on next frame when leaving fullscreen.
+            self.last_resized_path = None;
         }
         if actions.cycle_filter { self.cycle_filter(); }
         if actions.delete { self.request_delete(); }
@@ -991,6 +1042,20 @@ impl SnapView {
                 egui::vec2(fit_w * scale, fit_h * scale),
             ));
         } else {
+            // No texture yet, but keep last_image_rect in sync with the
+            // image's known aspect so overlays/chevrons sit in the right
+            // place during the brief decode window.
+            if let Some((w, h)) = self.display_dims(&path) {
+                let fit_w = w as f32;
+                let fit_h = h as f32;
+                let base_scale = (avail.x / fit_w).min(avail.y / fit_h).min(1.0).max(0.01);
+                let scale = base_scale * self.zoom;
+                let center = ui.available_rect_before_wrap().center() + self.pan;
+                self.last_image_rect = Some(egui::Rect::from_center_size(
+                    center,
+                    egui::vec2(fit_w * scale, fit_h * scale),
+                ));
+            }
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new("…")
