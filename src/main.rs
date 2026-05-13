@@ -110,6 +110,7 @@ struct SnapView {
     thumb_cache: Arc<Mutex<HashMap<PathBuf, LoadedImage>>>,
     thumb_textures: HashMap<PathBuf, egui::TextureHandle>,
     full_dims: HashMap<PathBuf, [usize; 2]>,
+    exif_quarter: HashMap<PathBuf, i32>,
 
     full_q: Arc<PrioQueue>,
     thumb_q: Arc<PrioQueue>,
@@ -146,8 +147,8 @@ struct TouchSwipe {
 }
 
 enum JobResult {
-    Full(PathBuf, LoadedImage),
-    Thumb(PathBuf, LoadedImage, Option<[usize; 2]>),
+    Full(PathBuf, LoadedImage, i32),
+    Thumb(PathBuf, LoadedImage, Option<[usize; 2]>, i32),
 }
 
 struct PrioQueueInner {
@@ -231,8 +232,8 @@ impl SnapView {
             let ctx = cc.egui_ctx.clone();
             thread::spawn(move || loop {
                 let path = match q.pop() { Some(p) => p, None => break };
-                let r = decode_image(&path);
-                let _ = tx.send(JobResult::Full(path, r));
+                let (r, q) = decode_image(&path);
+                let _ = tx.send(JobResult::Full(path, r, q));
                 ctx.request_repaint();
             });
         }
@@ -240,11 +241,14 @@ impl SnapView {
             let q = Arc::clone(&thumb_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
-            thread::spawn(move || loop {
-                let path = match q.pop() { Some(p) => p, None => break };
-                let (r, dims) = decode_thumb(&path);
-                let _ = tx.send(JobResult::Thumb(path, r, dims));
-                ctx.request_repaint();
+            thread::spawn(move || {
+                set_low_priority();
+                loop {
+                    let path = match q.pop() { Some(p) => p, None => break };
+                    let (r, dims, qrt) = decode_thumb(&path);
+                    let _ = tx.send(JobResult::Thumb(path, r, dims, qrt));
+                    ctx.request_repaint();
+                }
             });
         }
 
@@ -260,6 +264,7 @@ impl SnapView {
             thumb_cache: Arc::new(Mutex::new(HashMap::new())),
             thumb_textures: HashMap::new(),
             full_dims: HashMap::new(),
+            exif_quarter: HashMap::new(),
             full_q,
             thumb_q,
             result_rx,
@@ -331,6 +336,7 @@ impl SnapView {
         self.textures.clear();
         self.thumb_textures.clear();
         self.full_dims.clear();
+        self.exif_quarter.clear();
         self.rotation.clear();
 
         self.thumb_q.clear();
@@ -342,10 +348,13 @@ impl SnapView {
         } else {
             0
         };
-        // Bulk fill: every image, in order radiating outward from `cur`.
-        let mut order: Vec<PathBuf> = Vec::with_capacity(n);
+        // Lazy thumb fill: only seed the immediate vicinity. The rest is added
+        // on demand by prioritize_thumbs() as the user navigates, so we don't
+        // saturate cores decoding thumbs the user may never see.
+        const THUMB_INITIAL_RADIUS: usize = 30;
+        let mut order: Vec<PathBuf> = Vec::with_capacity(THUMB_INITIAL_RADIUS * 2 + 1);
         if n > 0 { order.push(self.images[cur].clone()); }
-        for d in 1..n {
+        for d in 1..=THUMB_INITIAL_RADIUS.min(n.saturating_sub(1)) {
             if cur + d < n { order.push(self.images[cur + d].clone()); }
             if cur >= d { order.push(self.images[cur - d].clone()); }
         }
@@ -409,7 +418,8 @@ impl SnapView {
     fn drain_results(&mut self, ctx: &egui::Context) {
         while let Ok(res) = self.result_rx.try_recv() {
             match res {
-                JobResult::Full(path, result) => {
+                JobResult::Full(path, result, exif_q) => {
+                    self.exif_quarter.insert(path.clone(), exif_q);
                     let mut cache = self.cache.lock().unwrap();
                     cache.insert(path.clone(), result.clone());
                     drop(cache);
@@ -433,7 +443,8 @@ impl SnapView {
                         }
                     }
                 }
-                JobResult::Thumb(path, result, dims) => {
+                JobResult::Thumb(path, result, dims, exif_q) => {
+                    self.exif_quarter.entry(path.clone()).or_insert(exif_q);
                     let mut tc = self.thumb_cache.lock().unwrap();
                     tc.insert(path.clone(), result.clone());
                     drop(tc);
@@ -594,6 +605,8 @@ impl SnapView {
         self.textures.remove(&path);
         self.thumb_textures.remove(&path);
         self.rotation.remove(&path);
+        self.exif_quarter.remove(&path);
+        self.full_dims.remove(&path);
         self.sidecars.remove(&path);
         self.images.remove(idx);
         if idx <= self.current && self.current > 0 {
@@ -743,7 +756,10 @@ impl SnapView {
             self.filter_selected.remove(p);
             self.cache.lock().unwrap().remove(p);
             self.textures.remove(p);
+            self.thumb_textures.remove(p);
             self.rotation.remove(p);
+            self.exif_quarter.remove(p);
+            self.full_dims.remove(p);
         }
         self.images.retain(|p| !moved.contains(p));
         if let Some(folder) = &self.folder {
@@ -931,7 +947,9 @@ impl SnapView {
 
         self.ensure_texture(ctx, &path);
 
-        let rotation_quarter = *self.rotation.get(&path).unwrap_or(&0);
+        let user_quarter = *self.rotation.get(&path).unwrap_or(&0);
+        let exif_q = *self.exif_quarter.get(&path).unwrap_or(&0);
+        let rotation_quarter = (user_quarter + exif_q).rem_euclid(4);
 
         let full_tex = self.textures.get(&path).cloned();
         let tex_opt = full_tex.clone().or_else(|| self.thumb_textures.get(&path).cloned());
@@ -1542,7 +1560,7 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::Dynamic
     Some(image::DynamicImage::ImageRgba8(rgba_img))
 }
 
-fn decode_image(path: &Path) -> LoadedImage {
+fn decode_image(path: &Path) -> (LoadedImage, i32) {
     let (img, did_jpeg_scale) = if is_jpeg(path) {
         match decode_jpeg_scaled(path, FULL_MAX_DIM) {
             Some(i) => (Some(i), true),
@@ -1551,12 +1569,10 @@ fn decode_image(path: &Path) -> LoadedImage {
     } else {
         (image::open(path).ok(), false)
     };
-    let Some(mut img) = img else { return LoadedImage::Failed };
+    let Some(mut img) = img else { return (LoadedImage::Failed, 0) };
     let orient = read_exif_orientation(path).unwrap_or(1);
-    img = apply_exif_orientation(img, orient);
-    // jpeg-decoder already produced a near-target size via native DCT scaling.
-    // Only fall back to a (slow) software resize for non-JPEG formats above
-    // the cap.
+    let display_quarter;
+    (img, display_quarter) = apply_exif_orientation_lazy(img, orient);
     if !did_jpeg_scale {
         let max_dim = img.width().max(img.height());
         if max_dim > FULL_MAX_DIM {
@@ -1566,26 +1582,157 @@ fn decode_image(path: &Path) -> LoadedImage {
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     let pixels = rgba.into_raw();
-    let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-    LoadedImage::Ready(Arc::new(ci))
+    let ci = color_image_from_rgba(size, pixels);
+    (LoadedImage::Ready(Arc::new(ci)), display_quarter)
 }
 
-fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>) {
+fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>, i32) {
+    if is_jpeg(path) {
+        if let Some(tup) = decode_jpeg_exif_thumb(path) {
+            return tup;
+        }
+    }
     let img = if is_jpeg(path) {
         decode_jpeg_scaled(path, THUMB_MAX).or_else(|| image::open(path).ok())
     } else {
         image::open(path).ok()
     };
-    let Some(mut img) = img else { return (LoadedImage::Failed, None) };
+    let Some(mut img) = img else { return (LoadedImage::Failed, None, 0) };
     let orient = read_exif_orientation(path).unwrap_or(1);
-    img = apply_exif_orientation(img, orient);
+    let display_quarter;
+    (img, display_quarter) = apply_exif_orientation_lazy(img, orient);
     let full_dims = [img.width() as usize, img.height() as usize];
     let small = img.thumbnail(THUMB_MAX, THUMB_MAX);
     let rgba = small.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     let pixels = rgba.into_raw();
-    let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-    (LoadedImage::Ready(Arc::new(ci)), Some(full_dims))
+    let ci = color_image_from_rgba(size, pixels);
+    (LoadedImage::Ready(Arc::new(ci)), Some(full_dims), display_quarter)
+}
+
+/// Read the embedded thumbnail (typically 160x120, 5-15 KB) from a JPEG's
+/// EXIF APP1 segment. Cameras and phones embed this for instant preview;
+/// decoding it is ~5 ms vs hundreds of ms for the full image. Returns the
+/// usual decode_thumb tuple with display_quarter already folded.
+fn decode_jpeg_exif_thumb(path: &Path) -> Option<(LoadedImage, Option<[usize; 2]>, i32)> {
+    let (thumb_bytes, full_w, full_h, orient) = read_jpeg_exif_metadata(path)?;
+    let thumb_bytes = thumb_bytes?;
+    let dyn_img = image::load_from_memory_with_format(&thumb_bytes, image::ImageFormat::Jpeg).ok()?;
+    let (img, display_quarter) = apply_exif_orientation_lazy(dyn_img, orient);
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = rgba.into_raw();
+    let ci = color_image_from_rgba(size, pixels);
+    let full_dims = if full_w > 0 && full_h > 0 {
+        // Post-EXIF dims: swap for rotation-only orientations.
+        if (5..=8).contains(&orient) {
+            Some([full_h as usize, full_w as usize])
+        } else {
+            Some([full_w as usize, full_h as usize])
+        }
+    } else {
+        None
+    };
+    Some((LoadedImage::Ready(Arc::new(ci)), full_dims, display_quarter))
+}
+
+/// Minimal EXIF scanner: extracts (thumb_bytes?, full_width, full_height, orientation)
+/// without invoking a full EXIF library. Reads at most a few KB of header data
+/// before seeking directly to the thumbnail bytes.
+fn read_jpeg_exif_metadata(path: &Path) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut soi = [0u8; 2];
+    f.read_exact(&mut soi).ok()?;
+    if soi != [0xFF, 0xD8] { return None; }
+    // Scan JPEG segments for APP1 (FFE1) containing "Exif\0\0".
+    for _ in 0..32 {
+        let mut marker = [0u8; 2];
+        f.read_exact(&mut marker).ok()?;
+        if marker[0] != 0xFF { return None; }
+        if matches!(marker[1], 0xD9 | 0xDA) { return None; }
+        let mut len_bytes = [0u8; 2];
+        f.read_exact(&mut len_bytes).ok()?;
+        let seg_len = u16::from_be_bytes(len_bytes) as u64;
+        let seg_data_start = f.stream_position().ok()?;
+        if marker[1] == 0xE1 {
+            let mut id = [0u8; 6];
+            if f.read_exact(&mut id).is_err() {
+                f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+                continue;
+            }
+            if &id == b"Exif\0\0" {
+                return parse_tiff_for_metadata(&mut f);
+            } else {
+                f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+            }
+        } else {
+            f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+        }
+    }
+    None
+}
+
+fn parse_tiff_for_metadata(f: &mut std::fs::File) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let tiff_start = f.stream_position().ok()?;
+    let mut tiff_header = [0u8; 8];
+    f.read_exact(&mut tiff_header).ok()?;
+    let le = &tiff_header[0..2] == b"II";
+    let r16 = |b: &[u8]| if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) };
+    let r32 = |b: &[u8]| if le { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) } else { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) };
+    let ifd0_offset = r32(&tiff_header[4..8]) as u64;
+    f.seek(SeekFrom::Start(tiff_start + ifd0_offset)).ok()?;
+    let mut ne_buf = [0u8; 2];
+    f.read_exact(&mut ne_buf).ok()?;
+    let n_entries = r16(&ne_buf);
+    let mut orient: u32 = 1;
+    for _ in 0..n_entries {
+        let mut e = [0u8; 12];
+        f.read_exact(&mut e).ok()?;
+        let tag = r16(&e[0..2]);
+        if tag == 0x0112 {
+            // Orientation is SHORT (type=3); first value stored in the low half of value field.
+            orient = r16(&e[8..10]) as u32;
+        }
+    }
+    let mut next_off = [0u8; 4];
+    f.read_exact(&mut next_off).ok()?;
+    let ifd1_offset = r32(&next_off) as u64;
+    if ifd1_offset == 0 {
+        return Some((None, 0, 0, orient));
+    }
+    f.seek(SeekFrom::Start(tiff_start + ifd1_offset)).ok()?;
+    let mut ne_buf = [0u8; 2];
+    f.read_exact(&mut ne_buf).ok()?;
+    let n_entries = r16(&ne_buf);
+    let mut thumb_offset: Option<u32> = None;
+    let mut thumb_length: Option<u32> = None;
+    let mut img_w: u32 = 0;
+    let mut img_h: u32 = 0;
+    for _ in 0..n_entries {
+        let mut e = [0u8; 12];
+        f.read_exact(&mut e).ok()?;
+        let tag = r16(&e[0..2]);
+        let value = r32(&e[8..12]);
+        match tag {
+            0x0201 => thumb_offset = Some(value),
+            0x0202 => thumb_length = Some(value),
+            0x0100 => img_w = value,
+            0x0101 => img_h = value,
+            _ => {}
+        }
+    }
+    let bytes = match (thumb_offset, thumb_length) {
+        (Some(off), Some(len)) if len > 0 && len < 1_000_000 => {
+            f.seek(SeekFrom::Start(tiff_start + off as u64)).ok()?;
+            let mut data = vec![0u8; len as usize];
+            f.read_exact(&mut data).ok()?;
+            Some(data)
+        }
+        _ => None,
+    };
+    Some((bytes, img_w, img_h, orient))
 }
 
 fn read_exif_orientation(path: &Path) -> Option<u32> {
@@ -1596,25 +1743,70 @@ fn read_exif_orientation(path: &Path) -> Option<u32> {
     field.value.get_uint(0)
 }
 
-fn apply_exif_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
+/// EXIF orientation handling: rotation-only orientations (1/3/6/8) are
+/// deferred to display-time mesh rotation (free). Mirror orientations
+/// (2/4/5/7) are rare and still applied in pixels here.
+/// Returns (transformed_image, display_quarter_to_add).
+fn apply_exif_orientation_lazy(img: image::DynamicImage, orientation: u32) -> (image::DynamicImage, i32) {
     use image::DynamicImage;
     match orientation {
-        2 => DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&img)),
-        3 => img.rotate180(),
-        4 => DynamicImage::ImageRgba8(image::imageops::flip_vertical(&img)),
+        1 => (img, 0),
+        3 => (img, 2),
+        6 => (img, 1),
+        8 => (img, 3),
+        2 => (DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&img)), 0),
+        4 => (DynamicImage::ImageRgba8(image::imageops::flip_vertical(&img)), 0),
         5 => {
             let r = img.rotate90();
-            DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&r))
+            (DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&r)), 0)
         }
-        6 => img.rotate90(),
         7 => {
             let r = img.rotate270();
-            DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&r))
+            (DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&r)), 0)
         }
-        8 => img.rotate270(),
-        _ => img,
+        _ => (img, 0),
     }
 }
+
+fn color_image_from_rgba(size: [usize; 2], rgba: Vec<u8>) -> egui::ColorImage {
+    debug_assert_eq!(size[0] * size[1] * 4, rgba.len());
+    let pixel_count = rgba.len() / 4;
+    let mut pixels: Vec<egui::Color32> = Vec::with_capacity(pixel_count);
+    // Safety: Color32 is `#[repr(C)] struct(u8, u8, u8, u8)`, layout-identical
+    // to a packed RGBA tuple. We memcpy from the u8 buffer; avoids the per-pixel
+    // branch in ColorImage::from_rgba_unmultiplied (which is the bottleneck for
+    // multi-megapixel images).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            rgba.as_ptr() as *const egui::Color32,
+            pixels.as_mut_ptr(),
+            pixel_count,
+        );
+        pixels.set_len(pixel_count);
+    }
+    egui::ColorImage { size, pixels }
+}
+
+#[cfg(unix)]
+fn set_low_priority() {
+    unsafe { libc::nice(10); }
+}
+
+#[cfg(windows)]
+fn set_low_priority() {
+    use std::os::raw::c_int;
+    extern "system" {
+        fn GetCurrentThread() -> *mut std::ffi::c_void;
+        fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: c_int) -> i32;
+    }
+    const THREAD_PRIORITY_BELOW_NORMAL: c_int = -1;
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_low_priority() {}
 
 fn load_app_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../assets/icon.png");
