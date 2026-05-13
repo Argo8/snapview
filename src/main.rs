@@ -1740,9 +1740,15 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<(image::Dynami
     let icc = decoder.icc_profile();
     let w = info.width as u32;
     let h = info.height as u32;
+    // Guard against gigapixel JPEGs that would overflow u32 byte counts
+    // (anything past ~32_767 px on either axis). Done with usize arithmetic
+    // and checked_mul so the multiplication can't silently wrap.
+    let byte_count = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|wh| wh.checked_mul(4))?;
     let rgba: Vec<u8> = match info.pixel_format {
         jpeg_decoder::PixelFormat::RGB24 => {
-            let mut out = vec![0u8; (w * h * 4) as usize];
+            let mut out = vec![0u8; byte_count];
             for (i, c) in pixels.chunks_exact(3).enumerate() {
                 let o = i * 4;
                 out[o] = c[0];
@@ -1753,7 +1759,7 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<(image::Dynami
             out
         }
         jpeg_decoder::PixelFormat::L8 => {
-            let mut out = vec![0u8; (w * h * 4) as usize];
+            let mut out = vec![0u8; byte_count];
             for (i, &v) in pixels.iter().enumerate() {
                 let o = i * 4;
                 out[o] = v;
@@ -2146,18 +2152,27 @@ fn add_rounded_rect_with_uv(
 fn color_image_from_rgba(size: [usize; 2], rgba: Vec<u8>) -> egui::ColorImage {
     debug_assert_eq!(size[0] * size[1] * 4, rgba.len());
     let pixel_count = rgba.len() / 4;
-    let mut pixels: Vec<egui::Color32> = Vec::with_capacity(pixel_count);
-    // Safety: Color32 is `#[repr(C)] struct(u8, u8, u8, u8)`, layout-identical
-    // to a packed RGBA tuple. We memcpy from the u8 buffer; avoids the per-pixel
-    // branch in ColorImage::from_rgba_unmultiplied (which is the bottleneck for
-    // multi-megapixel images).
+    // Pre-fill with zeroed Color32 so capacity == len exactly (avoids the
+    // Vec::with_capacity-then-set_len trap where capacity may exceed the
+    // requested count and a future Vec::shrink_to_fit / drop relies on the
+    // allocator-reported capacity matching the typed length).
+    let mut pixels: Vec<egui::Color32> = vec![egui::Color32::TRANSPARENT; pixel_count];
+    // Safety: Color32 is `#[repr(C)] struct(u8, u8, u8, u8)` with alignment 1
+    // (alignment of u8) and size 4. The byte-level layout is therefore
+    // identical to a packed RGBA tuple, and rgba.len() == pixel_count * 4.
+    // We copy through *mut u8 so the source pointer's 1-byte alignment is
+    // sufficient on every platform regardless of any future Color32 layout
+    // tightening.
+    const _: () = {
+        assert!(std::mem::size_of::<egui::Color32>() == 4);
+        assert!(std::mem::align_of::<egui::Color32>() == 1);
+    };
     unsafe {
         std::ptr::copy_nonoverlapping(
-            rgba.as_ptr() as *const egui::Color32,
-            pixels.as_mut_ptr(),
-            pixel_count,
+            rgba.as_ptr(),
+            pixels.as_mut_ptr() as *mut u8,
+            rgba.len(),
         );
-        pixels.set_len(pixel_count);
     }
     egui::ColorImage { size, pixels }
 }
