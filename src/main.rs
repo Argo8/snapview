@@ -2257,7 +2257,24 @@ fn save_favorites(folder: &Path, favs: &HashSet<PathBuf>) {
         "# snapview favorites — one filename per line\n{}\n",
         names.join("\n")
     );
-    let _ = std::fs::write(&path, content);
+    // Atomic write: stage to a sibling .tmp first, then rename onto the
+    // real path. fs::rename is atomic on the same volume on every OS we
+    // target, so a crash mid-write can never leave .favorites.txt as a
+    // truncated empty file (which would silently wipe the user's
+    // favorites the next time we read it).
+    let mut tmp = path.clone();
+    let new_name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) => format!("{}.tmp", n),
+        None => return,
+    };
+    tmp.set_file_name(new_name);
+    if std::fs::write(&tmp, content.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn num_workers() -> usize {
