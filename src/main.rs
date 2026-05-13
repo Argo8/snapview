@@ -633,7 +633,14 @@ impl SnapView {
         self.full_dims.remove(&path);
         self.sidecars.remove(&path);
         self.images.remove(idx);
-        if idx <= self.current && self.current > 0 {
+        // Index fixup after removing `idx`:
+        //   idx <  current  -> shift current down by one (same image stays selected)
+        //   idx == current  -> leave current alone; the slot now holds what was
+        //                      next (so the viewer advances forward, matching
+        //                      most viewers' "delete then go to the following
+        //                      image" behavior). Clamped below.
+        //   idx >  current  -> nothing to do.
+        if idx < self.current {
             self.current -= 1;
         }
 
