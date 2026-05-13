@@ -1600,7 +1600,7 @@ fn is_jpeg(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::DynamicImage> {
+fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<(image::DynamicImage, Option<Vec<u8>>)> {
     let f = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(f);
     let mut decoder = jpeg_decoder::Decoder::new(reader);
@@ -1610,6 +1610,7 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::Dynamic
     let _ = decoder.scale(target, target);
     let pixels = decoder.decode().ok()?;
     let info = decoder.info()?;
+    let icc = decoder.icc_profile();
     let w = info.width as u32;
     let h = info.height as u32;
     let rgba: Vec<u8> = match info.pixel_format {
@@ -1638,17 +1639,68 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<image::Dynamic
         _ => return None,
     };
     let rgba_img = image::RgbaImage::from_raw(w, h, rgba)?;
-    Some(image::DynamicImage::ImageRgba8(rgba_img))
+    Some((image::DynamicImage::ImageRgba8(rgba_img), icc))
+}
+
+/// Open a non-JPEG via the image crate, returning the decoded DynamicImage
+/// alongside its embedded ICC profile (PNG iCCP, TIFF ICCProfile, etc).
+fn load_image_with_icc(path: &Path) -> Option<(image::DynamicImage, Option<Vec<u8>>)> {
+    use image::ImageDecoder;
+    let f = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(f);
+    let reader = image::ImageReader::new(reader).with_guessed_format().ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let img = image::DynamicImage::from_decoder(decoder).ok()?;
+    Some((img, icc))
+}
+
+/// Convert an RGBA buffer from its embedded ICC profile to sRGB in place.
+/// Returns true if a conversion was actually performed. The common case
+/// (sRGB or untagged) short-circuits to no-op.
+fn apply_icc_to_srgb(rgba: &mut [u8], icc_bytes: &[u8]) -> bool {
+    use lcms2::*;
+    let src = match Profile::new_icc(icc_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if let Some(desc) = src.info(InfoType::Description, Locale::none()) {
+        let d = desc.to_lowercase();
+        // sRGB and the various "untagged"/"display" aliases all map to our
+        // assumed output space — skip the per-pixel transform.
+        if d.contains("srgb") || d.contains("iec61966") {
+            return false;
+        }
+    }
+    let dst = Profile::new_srgb();
+    let transform = match Transform::new(
+        &src,
+        PixelFormat::RGBA_8,
+        &dst,
+        PixelFormat::RGBA_8,
+        Intent::Perceptual,
+    ) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    transform.transform_in_place(rgba);
+    true
 }
 
 fn decode_image(path: &Path) -> (LoadedImage, i32) {
-    let (img, did_jpeg_scale) = if is_jpeg(path) {
+    let (img, did_jpeg_scale, icc) = if is_jpeg(path) {
         match decode_jpeg_scaled(path, FULL_MAX_DIM) {
-            Some(i) => (Some(i), true),
-            None => (image::open(path).ok(), false),
+            Some((i, icc)) => (Some(i), true, icc),
+            None => {
+                let pair = load_image_with_icc(path);
+                let icc = pair.as_ref().and_then(|p| p.1.clone());
+                (pair.map(|p| p.0), false, icc)
+            }
         }
     } else {
-        (image::open(path).ok(), false)
+        let pair = load_image_with_icc(path);
+        let icc = pair.as_ref().and_then(|p| p.1.clone());
+        (pair.map(|p| p.0), false, icc)
     };
     let Some(mut img) = img else { return (LoadedImage::Failed, 0) };
     let orient = read_exif_orientation(path).unwrap_or(1);
@@ -1662,16 +1714,28 @@ fn decode_image(path: &Path) -> (LoadedImage, i32) {
     }
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
-    let pixels = rgba.into_raw();
+    let mut pixels = rgba.into_raw();
+    if let Some(icc_bytes) = &icc {
+        apply_icc_to_srgb(&mut pixels, icc_bytes);
+    }
     let ci = color_image_from_rgba(size, pixels);
     (LoadedImage::Ready(Arc::new(ci)), display_quarter)
 }
 
 fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>, i32) {
-    let img = if is_jpeg(path) {
-        decode_jpeg_scaled(path, THUMB_MAX).or_else(|| image::open(path).ok())
+    let (img, icc) = if is_jpeg(path) {
+        match decode_jpeg_scaled(path, THUMB_MAX) {
+            Some((i, icc)) => (Some(i), icc),
+            None => {
+                let pair = load_image_with_icc(path);
+                let icc = pair.as_ref().and_then(|p| p.1.clone());
+                (pair.map(|p| p.0), icc)
+            }
+        }
     } else {
-        image::open(path).ok()
+        let pair = load_image_with_icc(path);
+        let icc = pair.as_ref().and_then(|p| p.1.clone());
+        (pair.map(|p| p.0), icc)
     };
     let Some(mut img) = img else { return (LoadedImage::Failed, None, 0) };
     let orient = read_exif_orientation(path).unwrap_or(1);
@@ -1681,7 +1745,10 @@ fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>, i32) {
     let small = img.thumbnail(THUMB_MAX, THUMB_MAX);
     let rgba = small.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
-    let pixels = rgba.into_raw();
+    let mut pixels = rgba.into_raw();
+    if let Some(icc_bytes) = &icc {
+        apply_icc_to_srgb(&mut pixels, icc_bytes);
+    }
     let ci = color_image_from_rgba(size, pixels);
     (LoadedImage::Ready(Arc::new(ci)), Some(full_dims), display_quarter)
 }
