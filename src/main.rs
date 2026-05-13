@@ -132,6 +132,7 @@ struct SnapView {
     is_fullscreen: bool,
     last_resized_path: Option<PathBuf>,
     last_aspect_class: Option<i8>,
+    resize_paint_skip: u8,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -254,14 +255,11 @@ impl SnapView {
             let q = Arc::clone(&thumb_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
-            thread::spawn(move || {
-                set_low_priority();
-                loop {
-                    let path = match q.pop() { Some(p) => p, None => break };
-                    let (r, dims, qrt) = decode_thumb(&path);
-                    let _ = tx.send(JobResult::Thumb(path, r, dims, qrt));
-                    ctx.request_repaint();
-                }
+            thread::spawn(move || loop {
+                let path = match q.pop() { Some(p) => p, None => break };
+                let (r, dims, qrt) = decode_thumb(&path);
+                let _ = tx.send(JobResult::Thumb(path, r, dims, qrt));
+                ctx.request_repaint();
             });
         }
         {
@@ -301,6 +299,7 @@ impl SnapView {
             is_fullscreen: false,
             last_resized_path: None,
             last_aspect_class: None,
+            resize_paint_skip: 0,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
@@ -790,6 +789,9 @@ impl SnapView {
 
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(new_w, new_h)));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(new_x, new_y)));
+        // Skip painting for a couple of frames so the OS resize doesn't
+        // stretch the old image into the new bounds (visible as a flash).
+        self.resize_paint_skip = 2;
 
         self.last_aspect_class = Some(class);
         self.last_resized_path = Some(path);
@@ -973,19 +975,39 @@ impl eframe::App for SnapView {
 
         let portrait = self.current_is_portrait();
         let suppress_dim = portrait && !self.is_fullscreen && self.target_zoom <= 1.001;
-        let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
         if !self.is_fullscreen {
             self.maybe_resize_window_to_image(ctx);
         }
+        // During an OS resize the previous frame's content gets stretched into
+        // the new bounds, producing a visible flash. For a couple of frames
+        // after we send the resize command we paint nothing — the desktop /
+        // app behind shows through transparently instead.
+        let resizing = self.resize_paint_skip > 0;
+        if resizing {
+            self.resize_paint_skip -= 1;
+        }
+        let bg_alpha: u8 = if resizing {
+            0
+        } else if focused && !suppress_dim {
+            235
+        } else {
+            0
+        };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
-            self.render_image(ui, ctx);
-            self.render_overlay(ui);
-            self.handle_background_interaction(ui, ctx);
-            self.render_close_button(ui);
-            self.render_nav_chevrons(ui);
-            self.handle_touch_swipe(ui);
+            if !resizing {
+                self.render_image(ui, ctx);
+                self.render_overlay(ui);
+                self.handle_background_interaction(ui, ctx);
+                self.render_close_button(ui);
+                self.render_nav_chevrons(ui);
+                self.handle_touch_swipe(ui);
+            } else {
+                // Keep continuous repaint requests flowing so we exit the
+                // skip-frames state promptly.
+                ctx.request_repaint();
+            }
         });
 
         if self.show_filter {
@@ -1033,7 +1055,15 @@ impl eframe::App for SnapView {
         if actions.show_about { self.show_about = true; }
         if actions.request_hq {
             if let Some(p) = self.current_path() {
-                if self.hq_requested.insert(p.clone()) {
+                if self.hq_requested.contains(&p) {
+                    // Toggle off: drop HQ texture and re-queue the snappy full.
+                    self.hq_requested.remove(&p);
+                    self.cache.lock().unwrap().remove(&p);
+                    self.textures.remove(&p);
+                    self.full_q.prioritize(&[p]);
+                    self.filter_msg = Some(("HQ off".to_string(), 1.0));
+                } else {
+                    self.hq_requested.insert(p.clone());
                     self.hq_q.prioritize(&[p]);
                     self.filter_msg = Some(("HQ decode…".to_string(), 1.2));
                 }
@@ -1901,27 +1931,6 @@ fn color_image_from_rgba(size: [usize; 2], rgba: Vec<u8>) -> egui::ColorImage {
     }
     egui::ColorImage { size, pixels }
 }
-
-#[cfg(unix)]
-fn set_low_priority() {
-    unsafe { libc::nice(10); }
-}
-
-#[cfg(windows)]
-fn set_low_priority() {
-    use std::os::raw::c_int;
-    extern "system" {
-        fn GetCurrentThread() -> *mut std::ffi::c_void;
-        fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: c_int) -> i32;
-    }
-    const THREAD_PRIORITY_BELOW_NORMAL: c_int = -1;
-    unsafe {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn set_low_priority() {}
 
 fn load_app_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../assets/icon.png");
