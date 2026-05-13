@@ -1028,13 +1028,13 @@ impl eframe::App for SnapView {
         if actions.cancel_delete { self.pending_delete = None; }
         if actions.show_about { self.show_about = true; }
         if actions.request_hq {
-            // Global HQ mode toggle: when on, all subsequent decodes target
-            // native resolution. Existing cached/uploaded textures are
-            // discarded so the active image gets re-decoded at the new tier.
+            // Global HQ mode toggle. We keep the existing low-res textures on
+            // the GPU so the screen stays full while HQ decodes land in the
+            // background; the CPU-side ColorImage cache *is* cleared so that
+            // ensure_texture / re-uploads can't pull a stale low-res copy.
             let new_mode = !self.hq_mode.load(Ordering::Relaxed);
             self.hq_mode.store(new_mode, Ordering::Relaxed);
             self.cache.lock().unwrap().clear();
-            self.textures.clear();
             self.full_q.clear();
             self.queue_preload();
             self.filter_msg = Some((
@@ -1075,20 +1075,37 @@ impl SnapView {
 
         self.ensure_texture(ctx, &path);
 
-        // If the new image has no full or thumb yet, keep showing the
-        // previously displayed one so the screen never blanks during a
-        // navigation/resize transition.
-        let new_has_anything = self.textures.contains_key(&path)
-            || self.thumb_textures.contains_key(&path);
-        let draw_path: PathBuf = if new_has_anything {
+        // Choose what to actually paint. Preference order:
+        //   1. new path has a full texture                -> paint new (full).
+        //   2. previously displayed path has a full       -> keep painting prev,
+        //      so we never downgrade from a sharp image to a blurry thumb
+        //      while the user waits for the next full / HQ decode.
+        //   3. new path has a thumb (EXIF preview)        -> paint new (thumb).
+        //   4. previously displayed path has anything     -> paint prev.
+        //   5. fall through to the "..." placeholder.
+        let new_has_full = self.textures.contains_key(&path);
+        let new_has_thumb = self.thumb_textures.contains_key(&path);
+        let prev_has_full = self
+            .displayed_path
+            .as_ref()
+            .map(|p| self.textures.contains_key(p))
+            .unwrap_or(false);
+        let prev_has_anything = self
+            .displayed_path
+            .as_ref()
+            .map(|p| self.textures.contains_key(p) || self.thumb_textures.contains_key(p))
+            .unwrap_or(false);
+
+        let draw_path: PathBuf = if new_has_full {
             self.displayed_path = Some(path.clone());
             path.clone()
-        } else if let Some(prev) = self.displayed_path.clone() {
-            if self.textures.contains_key(&prev) || self.thumb_textures.contains_key(&prev) {
-                prev
-            } else {
-                path.clone()
-            }
+        } else if prev_has_full {
+            self.displayed_path.clone().unwrap()
+        } else if new_has_thumb {
+            self.displayed_path = Some(path.clone());
+            path.clone()
+        } else if prev_has_anything {
+            self.displayed_path.clone().unwrap()
         } else {
             path.clone()
         };
