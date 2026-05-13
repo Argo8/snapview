@@ -78,6 +78,7 @@ struct PendingActions {
     cancel_delete: bool,
     show_about: bool,
     request_hq: bool,
+    toggle_help: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -128,6 +129,7 @@ struct SnapView {
 
     show_filter: bool,
     show_about: bool,
+    show_help: bool,
     filter_selected: HashSet<PathBuf>,
 
     is_fullscreen: bool,
@@ -289,6 +291,7 @@ impl SnapView {
             result_rx,
             show_filter: false,
             show_about: false,
+            show_help: false,
             filter_selected: HashSet::new(),
             is_fullscreen: false,
             last_resized_path: None,
@@ -947,12 +950,14 @@ impl eframe::App for SnapView {
                 }
                 if i.key_pressed(egui::Key::Delete) { self.actions.delete = true; }
                 if i.key_pressed(egui::Key::Escape) {
-                    if self.is_fullscreen { self.actions.toggle_max = true; }
+                    if self.show_help { self.show_help = false; }
+                    else if self.is_fullscreen { self.actions.toggle_max = true; }
                     else { self.actions.quit = true; }
                 }
                 if i.key_pressed(egui::Key::O) && i.modifiers.ctrl { self.actions.open_folder = true; }
                 if i.key_pressed(egui::Key::F11) { self.actions.toggle_max = true; }
                 if i.key_pressed(egui::Key::Enter) && i.modifiers.alt { self.actions.toggle_max = true; }
+                if i.key_pressed(egui::Key::F1) { self.actions.toggle_help = true; }
             }
         });
 
@@ -1003,6 +1008,10 @@ impl eframe::App for SnapView {
             self.render_about(ctx);
         }
 
+        if self.show_help {
+            self.render_help(ctx);
+        }
+
         // Apply queued actions
         let actions = std::mem::take(&mut self.actions);
         if actions.next { self.next(); }
@@ -1034,6 +1043,7 @@ impl eframe::App for SnapView {
         if actions.confirm_delete { self.confirm_delete(); }
         if actions.cancel_delete { self.pending_delete = None; }
         if actions.show_about { self.show_about = true; }
+        if actions.toggle_help { self.show_help = !self.show_help; }
         if actions.request_hq {
             // Global HQ mode toggle. We keep the existing low-res textures on
             // the GPU so the screen stays full while HQ decodes land in the
@@ -1460,6 +1470,7 @@ impl SnapView {
             };
             if ui.button(hq_label).clicked() { self.actions.request_hq = true; ui.close_menu(); }
             ui.separator();
+            if ui.button("Keyboard shortcuts  (F1)").clicked() { self.actions.toggle_help = true; ui.close_menu(); }
             if ui.button("About snapview…").clicked() { self.actions.show_about = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
         });
@@ -1540,6 +1551,92 @@ impl SnapView {
 
         if do_confirm { self.actions.confirm_delete = true; }
         if do_cancel { self.actions.cancel_delete = true; }
+    }
+
+    fn render_help(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("help_dim"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    egui::Color32::from_rgba_premultiplied(0, 0, 0, 180),
+                );
+                if ui.allocate_rect(screen, egui::Sense::click()).clicked() {
+                    self.show_help = false;
+                }
+            });
+
+        let pairs_left: &[(&str, &str)] = &[
+            ("Next image", "→  /  scroll down"),
+            ("Previous image", "←  /  scroll up"),
+            ("Zoom in / out", "Ctrl + scroll"),
+            ("Reset zoom", "Num 0"),
+            ("HQ mode (native)", "Z"),
+            ("Open folder…", "Ctrl + O"),
+        ];
+        let pairs_right: &[(&str, &str)] = &[
+            ("Mark / unmark favorite", "Space"),
+            ("Cycle filter (all / favs / non-favs)", "F"),
+            ("Filter favorites window…", "Shift + F"),
+            ("Move to trash", "Delete"),
+            ("Rotate left / right", "Q  /  W"),
+            ("Toggle fullscreen", "F11  /  Alt + Enter"),
+            ("Show / hide this help", "F1"),
+            ("Quit (or exit fullscreen first)", "Esc"),
+        ];
+
+        egui::Window::new("Keyboard shortcuts")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                ui.set_min_width(560.0);
+                ui.add_space(4.0);
+                egui::Grid::new("help_grid")
+                    .num_columns(4)
+                    .spacing([24.0, 6.0])
+                    .show(ui, |ui| {
+                        let rows = pairs_left.len().max(pairs_right.len());
+                        for i in 0..rows {
+                            if let Some((desc, key)) = pairs_left.get(i) {
+                                ui.label(egui::RichText::new(*desc).color(egui::Color32::from_gray(220)));
+                                ui.label(egui::RichText::new(*key).strong().color(egui::Color32::from_rgb(180, 200, 255)));
+                            } else {
+                                ui.label("");
+                                ui.label("");
+                            }
+                            if let Some((desc, key)) = pairs_right.get(i) {
+                                ui.label(egui::RichText::new(*desc).color(egui::Color32::from_gray(220)));
+                                ui.label(egui::RichText::new(*key).strong().color(egui::Color32::from_rgb(180, 200, 255)));
+                            } else {
+                                ui.label("");
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Mouse:").strong());
+                    ui.label("drag = move window (or pan when zoomed) · double-click = fullscreen · right-click = menu");
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Touch:").strong());
+                    ui.label("swipe horizontally to flick between images");
+                });
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("Press F1 or Esc to dismiss")
+                        .color(egui::Color32::from_gray(150)).italics());
+                });
+                ui.add_space(2.0);
+            });
     }
 
     fn render_about(&mut self, ctx: &egui::Context) {
