@@ -130,6 +130,7 @@ struct SnapView {
 
     is_fullscreen: bool,
     last_resized_path: Option<PathBuf>,
+    last_aspect_class: Option<i8>,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -282,6 +283,7 @@ impl SnapView {
             filter_selected: HashSet::new(),
             is_fullscreen: false,
             last_resized_path: None,
+            last_aspect_class: None,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
@@ -711,31 +713,48 @@ impl SnapView {
         true
     }
 
-    /// When windowed, shrink/grow the window so its inner area matches the
-    /// image's aspect ratio. Height is left alone (so the user's preferred
-    /// vertical size is preserved); only width is adjusted. We do this once
-    /// per image change to avoid re-firing the OS resize every frame.
+    /// When windowed, only on a portrait ↔ landscape transition: rescale the
+    /// window's width to the new image's aspect, leave height untouched, and
+    /// reposition so the window stays centered around its previous middle.
+    /// Goal is the visual effect "the picture shrunk into portrait" rather
+    /// than "the window jumped sideways".
     fn maybe_resize_window_to_image(&mut self, ctx: &egui::Context) {
         let path = match self.current_path() { Some(p) => p, None => return };
         if self.last_resized_path.as_ref() == Some(&path) { return; }
         let (iw, ih) = match self.display_dims(&path) { Some(d) => d, None => return };
         if iw == 0 || ih == 0 { return; }
-        let cur = ctx.screen_rect().size();
-        // Use the longer screen-side as the reference so portrait↔landscape
-        // transitions are visually balanced (window doesn't shrink to a strip).
-        let reference = cur.x.max(cur.y).max(400.0);
         let aspect = iw as f32 / ih as f32;
-        let (new_w, new_h) = if aspect >= 1.0 {
-            (reference, reference / aspect)
-        } else {
-            (reference * aspect, reference)
-        };
-        // Avoid spurious resizes when already within a pixel.
-        if (cur.x - new_w).abs() < 2.0 && (cur.y - new_h).abs() < 2.0 {
+        let class: i8 = if aspect < 0.95 { 1 } else { 0 };
+
+        // Skip when aspect class hasn't changed: keep current window unchanged.
+        if Some(class) == self.last_aspect_class {
             self.last_resized_path = Some(path);
             return;
         }
+
+        // Need actual window geometry on screen to recenter. egui makes this
+        // available via ViewportInfo; if it's not populated yet, defer to
+        // next frame.
+        let outer = match ctx.input(|i| i.viewport().outer_rect) {
+            Some(r) => r,
+            None => return,
+        };
+        let new_h = outer.height();
+        let new_w = (new_h * aspect).max(200.0);
+        let new_x = outer.left() + (outer.width() - new_w) / 2.0;
+        let new_y = outer.top();
+
+        if (outer.width() - new_w).abs() < 2.0 {
+            // Nothing to resize; just remember the class.
+            self.last_aspect_class = Some(class);
+            self.last_resized_path = Some(path);
+            return;
+        }
+
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(new_w, new_h)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(new_x, new_y)));
+
+        self.last_aspect_class = Some(class);
         self.last_resized_path = Some(path);
     }
 
@@ -967,6 +986,7 @@ impl eframe::App for SnapView {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
             // Re-evaluate window sizing on next frame when leaving fullscreen.
             self.last_resized_path = None;
+            self.last_aspect_class = None;
         }
         if actions.cycle_filter { self.cycle_filter(); }
         if actions.delete { self.request_delete(); }
