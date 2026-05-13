@@ -9,11 +9,11 @@ use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
 const THUMB_MAX: u32 = 768;
-/// Ultimate safety cap for the full-resolution decode. Anything below this
-/// is decoded at native resolution (no quality loss). 16384 covers GigaPixel
-/// territory; above that we resort to a Triangle downscale to keep texture
-/// memory sane.
-const FULL_MAX_DIM: u32 = 16384;
+/// Target dimension for the full-resolution decode. 2400 covers 1440p
+/// displays at 1:1 and leaves headroom for zoom; for JPEGs the decoder
+/// picks the closest native DCT scale that's >= this value (so 4000-8000 px
+/// camera shots decode at 2000-4000 px in ~60-120 ms instead of seconds).
+const FULL_MAX_DIM: u32 = 2400;
 const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
     "rw2", "pef", "ptx", "srw", "dng", "raw", "rwl", "3fr", "fff", "erf",
@@ -23,11 +23,7 @@ const RAW_EXTS: &[&str] = &[
 ];
 const FAVORITES_FILE: &str = ".favorites.txt";
 const PRELOAD_RADIUS: usize = 3;
-/// How many full-resolution textures we keep uploaded on the GPU. At native
-/// resolution a 24 MP shot is ~96 MB and a 50 MP shot ~192 MB, so we keep
-/// this conservative; revisits are cheap because the CPU-side ColorImage
-/// cache (self.cache) is unbounded and a re-upload to the GPU is fast.
-const TEXTURE_CACHE_MAX: usize = 24;
+const TEXTURE_CACHE_MAX: usize = 60;
 
 fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = std::env::args().collect();
