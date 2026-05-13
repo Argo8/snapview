@@ -1140,11 +1140,24 @@ impl SnapView {
             let angle = rotation_quarter as f32 * std::f32::consts::FRAC_PI_2;
 
             let mut mesh = egui::Mesh::with_texture(tex.id());
-            mesh.add_rect_with_uv(
-                egui::Rect::from_center_size(egui::Pos2::ZERO, egui::vec2(draw_w, draw_h)),
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+            let local_rect =
+                egui::Rect::from_center_size(egui::Pos2::ZERO, egui::vec2(draw_w, draw_h));
+            let uv_rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            // macOS-style continuous-ish corner rounding when windowed. In
+            // fullscreen the image bleeds to the display edges (no panel
+            // around it to round against).
+            let corner_radius = if self.is_fullscreen { 0.0 } else { 12.0 };
+            if corner_radius > 0.5 {
+                add_rounded_rect_with_uv(
+                    &mut mesh,
+                    local_rect,
+                    uv_rect,
+                    corner_radius,
+                    egui::Color32::WHITE,
+                );
+            } else {
+                mesh.add_rect_with_uv(local_rect, uv_rect, egui::Color32::WHITE);
+            }
             mesh.rotate(egui::emath::Rot2::from_angle(angle), egui::Pos2::ZERO);
             mesh.translate(center.to_vec2());
             ui.painter().add(egui::Shape::mesh(mesh));
@@ -2069,6 +2082,64 @@ fn full_texture_options() -> egui::TextureOptions {
         minification: egui::TextureFilter::Linear,
         wrap_mode: egui::TextureWrapMode::ClampToEdge,
         mipmap_mode: Some(egui::TextureFilter::Linear),
+    }
+}
+
+/// Builds a textured rounded rect into an existing Mesh. Per-vertex UV is
+/// interpolated linearly from the position inside `rect`, so the caller can
+/// freely rotate/translate the resulting Mesh and the texture sticks with
+/// the geometry (rounded corners rotate together with the image content).
+fn add_rounded_rect_with_uv(
+    mesh: &mut egui::Mesh,
+    rect: egui::Rect,
+    uv: egui::Rect,
+    radius: f32,
+    color: egui::Color32,
+) {
+    let r = radius.clamp(0.0, rect.width().min(rect.height()) * 0.5);
+    if r < 0.5 {
+        mesh.add_rect_with_uv(rect, uv, color);
+        return;
+    }
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let segments: usize = 10;
+    // Corner arcs walked clockwise: top-left, top-right, bottom-right, bottom-left.
+    // Angles use egui's coord system (y grows downward).
+    let corners = [
+        (egui::pos2(rect.min.x + r, rect.min.y + r), PI, 1.5 * PI),
+        (egui::pos2(rect.max.x - r, rect.min.y + r), 1.5 * PI, 2.0 * PI),
+        (egui::pos2(rect.max.x - r, rect.max.y - r), 0.0, FRAC_PI_2),
+        (egui::pos2(rect.min.x + r, rect.max.y - r), FRAC_PI_2, PI),
+    ];
+    let center = rect.center();
+    let center_uv = egui::pos2(uv.min.x + uv.width() * 0.5, uv.min.y + uv.height() * 0.5);
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: center,
+        uv: center_uv,
+        color,
+    });
+    let mut perim_count: u32 = 0;
+    for &(c, a0, a1) in &corners {
+        for i in 0..=segments {
+            let t = i as f32 / segments as f32;
+            let a = a0 + (a1 - a0) * t;
+            let p = egui::pos2(c.x + r * a.cos(), c.y + r * a.sin());
+            let u = uv.min.x + (p.x - rect.min.x) / rect.width() * uv.width();
+            let v = uv.min.y + (p.y - rect.min.y) / rect.height() * uv.height();
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: p,
+                uv: egui::pos2(u, v),
+                color,
+            });
+            perim_count += 1;
+        }
+    }
+    for i in 0..perim_count {
+        let next = (i + 1) % perim_count;
+        mesh.indices.push(base);
+        mesh.indices.push(base + 1 + i);
+        mesh.indices.push(base + 1 + next);
     }
 }
 
