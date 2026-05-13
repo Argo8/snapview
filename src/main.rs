@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 const SUPPORTED_EXTS: &[&str] = &["jpg", "jpeg", "png", "bmp", "gif", "webp", "tif", "tiff"];
-const THUMB_MAX: u32 = 256;
+const THUMB_MAX: u32 = 768;
 const FULL_MAX_DIM: u32 = 2400;
 const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf",
@@ -1587,11 +1587,6 @@ fn decode_image(path: &Path) -> (LoadedImage, i32) {
 }
 
 fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>, i32) {
-    if is_jpeg(path) {
-        if let Some(tup) = decode_jpeg_exif_thumb(path) {
-            return tup;
-        }
-    }
     let img = if is_jpeg(path) {
         decode_jpeg_scaled(path, THUMB_MAX).or_else(|| image::open(path).ok())
     } else {
@@ -1608,131 +1603,6 @@ fn decode_thumb(path: &Path) -> (LoadedImage, Option<[usize; 2]>, i32) {
     let pixels = rgba.into_raw();
     let ci = color_image_from_rgba(size, pixels);
     (LoadedImage::Ready(Arc::new(ci)), Some(full_dims), display_quarter)
-}
-
-/// Read the embedded thumbnail (typically 160x120, 5-15 KB) from a JPEG's
-/// EXIF APP1 segment. Cameras and phones embed this for instant preview;
-/// decoding it is ~5 ms vs hundreds of ms for the full image. Returns the
-/// usual decode_thumb tuple with display_quarter already folded.
-fn decode_jpeg_exif_thumb(path: &Path) -> Option<(LoadedImage, Option<[usize; 2]>, i32)> {
-    let (thumb_bytes, full_w, full_h, orient) = read_jpeg_exif_metadata(path)?;
-    let thumb_bytes = thumb_bytes?;
-    let dyn_img = image::load_from_memory_with_format(&thumb_bytes, image::ImageFormat::Jpeg).ok()?;
-    let (img, display_quarter) = apply_exif_orientation_lazy(dyn_img, orient);
-    let rgba = img.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    let pixels = rgba.into_raw();
-    let ci = color_image_from_rgba(size, pixels);
-    let full_dims = if full_w > 0 && full_h > 0 {
-        // Post-EXIF dims: swap for rotation-only orientations.
-        if (5..=8).contains(&orient) {
-            Some([full_h as usize, full_w as usize])
-        } else {
-            Some([full_w as usize, full_h as usize])
-        }
-    } else {
-        None
-    };
-    Some((LoadedImage::Ready(Arc::new(ci)), full_dims, display_quarter))
-}
-
-/// Minimal EXIF scanner: extracts (thumb_bytes?, full_width, full_height, orientation)
-/// without invoking a full EXIF library. Reads at most a few KB of header data
-/// before seeking directly to the thumbnail bytes.
-fn read_jpeg_exif_metadata(path: &Path) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut soi = [0u8; 2];
-    f.read_exact(&mut soi).ok()?;
-    if soi != [0xFF, 0xD8] { return None; }
-    // Scan JPEG segments for APP1 (FFE1) containing "Exif\0\0".
-    for _ in 0..32 {
-        let mut marker = [0u8; 2];
-        f.read_exact(&mut marker).ok()?;
-        if marker[0] != 0xFF { return None; }
-        if matches!(marker[1], 0xD9 | 0xDA) { return None; }
-        let mut len_bytes = [0u8; 2];
-        f.read_exact(&mut len_bytes).ok()?;
-        let seg_len = u16::from_be_bytes(len_bytes) as u64;
-        let seg_data_start = f.stream_position().ok()?;
-        if marker[1] == 0xE1 {
-            let mut id = [0u8; 6];
-            if f.read_exact(&mut id).is_err() {
-                f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
-                continue;
-            }
-            if &id == b"Exif\0\0" {
-                return parse_tiff_for_metadata(&mut f);
-            } else {
-                f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
-            }
-        } else {
-            f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
-        }
-    }
-    None
-}
-
-fn parse_tiff_for_metadata(f: &mut std::fs::File) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let tiff_start = f.stream_position().ok()?;
-    let mut tiff_header = [0u8; 8];
-    f.read_exact(&mut tiff_header).ok()?;
-    let le = &tiff_header[0..2] == b"II";
-    let r16 = |b: &[u8]| if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) };
-    let r32 = |b: &[u8]| if le { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) } else { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) };
-    let ifd0_offset = r32(&tiff_header[4..8]) as u64;
-    f.seek(SeekFrom::Start(tiff_start + ifd0_offset)).ok()?;
-    let mut ne_buf = [0u8; 2];
-    f.read_exact(&mut ne_buf).ok()?;
-    let n_entries = r16(&ne_buf);
-    let mut orient: u32 = 1;
-    for _ in 0..n_entries {
-        let mut e = [0u8; 12];
-        f.read_exact(&mut e).ok()?;
-        let tag = r16(&e[0..2]);
-        if tag == 0x0112 {
-            // Orientation is SHORT (type=3); first value stored in the low half of value field.
-            orient = r16(&e[8..10]) as u32;
-        }
-    }
-    let mut next_off = [0u8; 4];
-    f.read_exact(&mut next_off).ok()?;
-    let ifd1_offset = r32(&next_off) as u64;
-    if ifd1_offset == 0 {
-        return Some((None, 0, 0, orient));
-    }
-    f.seek(SeekFrom::Start(tiff_start + ifd1_offset)).ok()?;
-    let mut ne_buf = [0u8; 2];
-    f.read_exact(&mut ne_buf).ok()?;
-    let n_entries = r16(&ne_buf);
-    let mut thumb_offset: Option<u32> = None;
-    let mut thumb_length: Option<u32> = None;
-    let mut img_w: u32 = 0;
-    let mut img_h: u32 = 0;
-    for _ in 0..n_entries {
-        let mut e = [0u8; 12];
-        f.read_exact(&mut e).ok()?;
-        let tag = r16(&e[0..2]);
-        let value = r32(&e[8..12]);
-        match tag {
-            0x0201 => thumb_offset = Some(value),
-            0x0202 => thumb_length = Some(value),
-            0x0100 => img_w = value,
-            0x0101 => img_h = value,
-            _ => {}
-        }
-    }
-    let bytes = match (thumb_offset, thumb_length) {
-        (Some(off), Some(len)) if len > 0 && len < 1_000_000 => {
-            f.seek(SeekFrom::Start(tiff_start + off as u64)).ok()?;
-            let mut data = vec![0u8; len as usize];
-            f.read_exact(&mut data).ok()?;
-            Some(data)
-        }
-        _ => None,
-    };
-    Some((bytes, img_w, img_h, orient))
 }
 
 fn read_exif_orientation(path: &Path) -> Option<u32> {
