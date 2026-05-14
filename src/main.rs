@@ -97,6 +97,8 @@ struct PendingActions {
     request_hq: bool,
     toggle_help: bool,
     toggle_metadata: bool,
+    show_in_explorer: bool,
+    copy_to_clipboard: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -659,6 +661,72 @@ impl SnapView {
         self.queue_preload();
         self.prioritize_thumbs();
         self.filter_msg = Some((format!("Added: {}", file_label(path)), 1.5));
+    }
+
+    /// Open the platform file manager focused on the currently displayed
+    /// image. On Windows that's `explorer.exe /select,path` which highlights
+    /// the file inside its folder; macOS `open -R path` does the same;
+    /// Linux falls back to `xdg-open <folder>` since there's no portable way
+    /// to highlight a specific file.
+    fn show_current_in_file_manager(&mut self) {
+        let Some(path) = self.current_path() else { return };
+        let res = if cfg!(target_os = "windows") {
+            std::process::Command::new("explorer.exe")
+                .arg(format!("/select,{}", path.display()))
+                .spawn()
+                .map(|_| ())
+        } else if cfg!(target_os = "macos") {
+            std::process::Command::new("open")
+                .arg("-R")
+                .arg(&path)
+                .spawn()
+                .map(|_| ())
+        } else {
+            let parent = path.parent().unwrap_or(Path::new("."));
+            std::process::Command::new("xdg-open")
+                .arg(parent)
+                .spawn()
+                .map(|_| ())
+        };
+        match res {
+            Ok(_) => self.filter_msg = Some(("Opened in file manager".to_string(), 1.2)),
+            Err(e) => self.filter_msg = Some((format!("Couldn't open file manager: {}", e), 2.5)),
+        }
+    }
+
+    /// Copy the currently displayed image (current full or thumb texture)
+    /// to the system clipboard as a raw bitmap. Anything with clipboard
+    /// support (Word, Photoshop, browsers, chat apps) accepts this.
+    fn copy_current_to_clipboard(&mut self) {
+        let Some(path) = self.current_path() else { return };
+        let ci = {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            match cache.get(&path) {
+                Some(LoadedImage::Ready(ci)) => Some(ci.clone()),
+                _ => None,
+            }
+        };
+        let ci = match ci {
+            Some(c) => c,
+            None => {
+                self.filter_msg = Some(("Image not loaded yet".to_string(), 1.5));
+                return;
+            }
+        };
+        let bytes: Vec<u8> = ci
+            .pixels
+            .iter()
+            .flat_map(|c| [c.r(), c.g(), c.b(), c.a()])
+            .collect();
+        let img = arboard::ImageData {
+            width: ci.size[0],
+            height: ci.size[1],
+            bytes: std::borrow::Cow::Owned(bytes),
+        };
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_image(img)) {
+            Ok(_) => self.filter_msg = Some(("Copied to clipboard".to_string(), 1.2)),
+            Err(e) => self.filter_msg = Some((format!("Clipboard error: {}", e), 2.5)),
+        }
     }
 
     fn handle_fs_remove(&mut self, path: &Path) {
@@ -1246,6 +1314,8 @@ impl eframe::App for SnapView {
                 if i.key_pressed(egui::Key::Enter) && i.modifiers.alt { self.actions.toggle_max = true; }
                 if i.key_pressed(egui::Key::F1) { self.actions.toggle_help = true; }
                 if i.key_pressed(egui::Key::I) { self.actions.toggle_metadata = true; }
+                if i.key_pressed(egui::Key::E) && i.modifiers.ctrl { self.actions.show_in_explorer = true; }
+                if i.key_pressed(egui::Key::C) && i.modifiers.ctrl { self.actions.copy_to_clipboard = true; }
             }
         });
 
@@ -1334,6 +1404,8 @@ impl eframe::App for SnapView {
         if actions.show_prefs { self.show_prefs = true; }
         if actions.toggle_help { self.show_help = !self.show_help; }
         if actions.toggle_metadata { self.show_metadata = !self.show_metadata; }
+        if actions.show_in_explorer { self.show_current_in_file_manager(); }
+        if actions.copy_to_clipboard { self.copy_current_to_clipboard(); }
         if actions.request_hq {
             // Global HQ mode toggle. We keep the existing low-res textures on
             // the GPU so the screen stays full while HQ decodes land in the
@@ -1814,6 +1886,9 @@ impl SnapView {
             ui.separator();
             if ui.button("Move to trash  (Delete)").clicked() { self.actions.delete = true; ui.close_menu(); }
             ui.separator();
+            if ui.button("Copy image to clipboard  (Ctrl+C)").clicked() { self.actions.copy_to_clipboard = true; ui.close_menu(); }
+            if ui.button("Show in file manager  (Ctrl+E)").clicked() { self.actions.show_in_explorer = true; ui.close_menu(); }
+            ui.separator();
             if ui.button("Toggle fullscreen  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
             ui.separator();
             let hq_label = if self.hq_mode.load(Ordering::Relaxed) {
@@ -1932,6 +2007,8 @@ impl SnapView {
             ("HQ mode (native)", "Z"),
             ("Show / hide image info", "I"),
             ("Open folder…", "Ctrl + O"),
+            ("Copy image to clipboard", "Ctrl + C"),
+            ("Show in file manager", "Ctrl + E"),
         ];
         let pairs_right: &[(&str, &str)] = &[
             ("Mark / unmark favorite", "Space"),
