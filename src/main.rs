@@ -146,7 +146,10 @@ struct SnapView {
     /// results whose generation no longer matches, so leftover work from a
     /// previously-open folder can't poison the new folder's cache.
     current_generation: Arc<AtomicU64>,
-    zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Recently zoom-promoted images. Bounded FIFO (most recent at the back);
+    /// workers consult this in addition to hq_mode to decide whether to decode
+    /// at HQ. Small cap keeps the GPU-resident HQ texture footprint sane.
+    zoom_hq_paths: Arc<Mutex<VecDeque<PathBuf>>>,
     result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
@@ -268,7 +271,8 @@ impl SnapView {
         let full_q = PrioQueue::new();
         let thumb_q = PrioQueue::new();
         let hq_mode = Arc::new(AtomicBool::new(false));
-        let zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let zoom_hq_paths: Arc<Mutex<VecDeque<PathBuf>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
         let current_generation = Arc::new(AtomicU64::new(0));
 
         let total = num_workers();
@@ -771,13 +775,18 @@ impl SnapView {
             self.target_pan = egui::Vec2::ZERO;
         }
         // First zoom past ~1.05 on the current image promotes it to a native
-        // re-decode in the background, so the pixels stay crisp at any zoom
-        // factor. Once promoted, it stays HQ for this session (we don't
-        // downgrade on zoom out — re-decoding is the expensive part).
+        // re-decode in the background. Promotions are kept as a bounded FIFO
+        // (most recent at the back) so that long browsing sessions don't
+        // accumulate dozens of native-resolution textures.
         if self.target_zoom > 1.05 {
             if let Some(p) = self.current_path() {
+                const ZOOM_HQ_MAX: usize = 20;
                 let mut set = self.zoom_hq_paths.lock().unwrap();
-                if set.insert(p.clone()) {
+                if !set.iter().any(|x| x == &p) {
+                    if set.len() >= ZOOM_HQ_MAX {
+                        set.pop_front();
+                    }
+                    set.push_back(p.clone());
                     drop(set);
                     self.cache.lock().unwrap().remove(&p);
                     self.textures.remove(&p);
