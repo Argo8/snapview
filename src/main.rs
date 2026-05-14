@@ -261,7 +261,7 @@ impl PrioQueue {
     }
 
     fn enqueue_back(&self, paths: &[PathBuf]) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for p in paths {
             if g.in_queue.insert(p.clone()) {
                 g.queue.push_back(p.clone());
@@ -271,7 +271,7 @@ impl PrioQueue {
     }
 
     fn prioritize(&self, paths: &[PathBuf]) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for p in paths.iter().rev() {
             if let Some(pos) = g.queue.iter().position(|x| x == p) {
                 g.queue.remove(pos);
@@ -284,7 +284,7 @@ impl PrioQueue {
     }
 
     fn clear(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.queue.clear();
         g.in_queue.clear();
     }
@@ -293,20 +293,20 @@ impl PrioQueue {
     /// their pop loop. Used from Drop to unwind decoder threads cleanly
     /// instead of leaving them parked on the Condvar at process exit.
     fn close(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
         self.cv.notify_all();
     }
 
     fn pop(&self) -> Option<PathBuf> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(p) = g.queue.pop_front() {
                 g.in_queue.remove(&p);
                 return Some(p);
             }
             if g.closed { return None; }
-            g = self.cv.wait(g).unwrap();
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -336,7 +336,7 @@ impl SnapView {
                 let path = match q.pop() { Some(p) => p, None => break };
                 let job_gen = gen.load(Ordering::Relaxed);
                 let need_hq = hq.load(Ordering::Relaxed)
-                    || zoom_hq.lock().unwrap().contains(&path);
+                    || zoom_hq.lock().unwrap_or_else(|e| e.into_inner()).contains(&path);
                 let target = if need_hq { HQ_MAX_DIM } else { FULL_MAX_DIM };
                 let (r, q) = decode_image_to(&path, target);
                 let _ = tx.send(JobResult::Full(job_gen, path, r, q));
@@ -449,15 +449,15 @@ impl SnapView {
         self.favorites = load_favorites(folder, &images);
         self.images = images;
         self.sidecars = sidecars;
-        self.cache.lock().unwrap().clear();
-        self.thumb_cache.lock().unwrap().clear();
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.textures.clear();
         self.thumb_textures.clear();
         self.full_dims.clear();
         self.exif_quarter.clear();
         self.metadata_cache.clear();
         self.rotation.clear();
-        self.zoom_hq_paths.lock().unwrap().clear();
+        self.zoom_hq_paths.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.displayed_path = None;
         self.nav_direction = 1;
 
@@ -537,7 +537,7 @@ impl SnapView {
         const RADIUS: usize = 12;
         let paths = self.directional_neighbors(RADIUS);
         // Drop already-loaded ones from the priority list.
-        let cache = self.thumb_cache.lock().unwrap();
+        let cache = self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner());
         let pending: Vec<PathBuf> = paths
             .into_iter()
             .filter(|p| !matches!(cache.get(p), Some(LoadedImage::Ready(_)) | Some(LoadedImage::Failed)))
@@ -551,7 +551,7 @@ impl SnapView {
     fn queue_preload(&self) {
         if self.images.is_empty() { return; }
         let paths = self.directional_neighbors(PRELOAD_RADIUS);
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let pending: Vec<PathBuf> = paths
             .into_iter()
             .filter(|p| !matches!(cache.get(p), Some(LoadedImage::Ready(_)) | Some(LoadedImage::Failed)))
@@ -580,7 +580,7 @@ impl SnapView {
             match res {
                 JobResult::Full(_, path, result, exif_q) => {
                     self.exif_quarter.insert(path.clone(), exif_q);
-                    let mut cache = self.cache.lock().unwrap();
+                    let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                     cache.insert(path.clone(), result.clone());
                     drop(cache);
                     if let LoadedImage::Ready(ci) = result {
@@ -605,7 +605,7 @@ impl SnapView {
                 }
                 JobResult::Thumb(_, path, result, dims, exif_q) => {
                     self.exif_quarter.entry(path.clone()).or_insert(exif_q);
-                    let mut tc = self.thumb_cache.lock().unwrap();
+                    let mut tc = self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner());
                     tc.insert(path.clone(), result.clone());
                     drop(tc);
                     if let Some(d) = dims { self.full_dims.insert(path.clone(), d); }
@@ -643,7 +643,7 @@ impl SnapView {
 
     fn ensure_texture(&mut self, ctx: &egui::Context, path: &Path) {
         if self.textures.contains_key(path) { return; }
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(LoadedImage::Ready(ci)) = cache.get(path) {
             let ci = ci.clone();
             drop(cache);
@@ -759,8 +759,8 @@ impl SnapView {
         if was_fav {
             self.persist_favorites();
         }
-        self.cache.lock().unwrap().remove(&path);
-        self.thumb_cache.lock().unwrap().remove(&path);
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
+        self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
         self.textures.remove(&path);
         self.thumb_textures.remove(&path);
         self.rotation.remove(&path);
@@ -864,14 +864,14 @@ impl SnapView {
         if self.target_zoom > 1.05 {
             if let Some(p) = self.current_path() {
                 const ZOOM_HQ_MAX: usize = 20;
-                let mut set = self.zoom_hq_paths.lock().unwrap();
+                let mut set = self.zoom_hq_paths.lock().unwrap_or_else(|e| e.into_inner());
                 if !set.iter().any(|x| x == &p) {
                     if set.len() >= ZOOM_HQ_MAX {
                         set.pop_front();
                     }
                     set.push_back(p.clone());
                     drop(set);
-                    self.cache.lock().unwrap().remove(&p);
+                    self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(&p);
                     self.textures.remove(&p);
                     self.full_q.prioritize(&[p]);
                 }
@@ -958,7 +958,7 @@ impl SnapView {
     /// any cached info available — full cache, thumb full_dims, or the texture
     /// itself. EXIF and user rotation both factored in.
     fn display_dims(&self, path: &Path) -> Option<(usize, usize)> {
-        let raw = if let Some(LoadedImage::Ready(ci)) = self.cache.lock().unwrap().get(path) {
+        let raw = if let Some(LoadedImage::Ready(ci)) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
             Some((ci.size[0], ci.size[1]))
         } else if let Some(d) = self.full_dims.get(path) {
             Some((d[0], d[1]))
@@ -1014,7 +1014,7 @@ impl SnapView {
         for p in &moved {
             self.favorites.remove(p);
             self.filter_selected.remove(p);
-            self.cache.lock().unwrap().remove(p);
+            self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(p);
             self.textures.remove(p);
             self.thumb_textures.remove(p);
             self.rotation.remove(p);
@@ -1209,7 +1209,7 @@ impl eframe::App for SnapView {
             // ensure_texture / re-uploads can't pull a stale low-res copy.
             let new_mode = !self.hq_mode.load(Ordering::Relaxed);
             self.hq_mode.store(new_mode, Ordering::Relaxed);
-            self.cache.lock().unwrap().clear();
+            self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
             self.full_q.clear();
             self.queue_preload();
             self.filter_msg = Some((
