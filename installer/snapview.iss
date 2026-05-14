@@ -102,49 +102,41 @@ Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes
 ; .jpg
 Root: HKA; Subkey: "Software\Classes\snapview.jpg"; ValueType: string; ValueData: "JPEG image"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\snapview.jpg"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "JPEG image"
-Root: HKA; Subkey: "Software\Classes\snapview.jpg\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
 Root: HKA; Subkey: "Software\Classes\snapview.jpg\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\.jpg\OpenWithProgids"; ValueType: string; ValueName: "snapview.jpg"; ValueData: ""; Flags: uninsdeletevalue
 ; .jpeg
 Root: HKA; Subkey: "Software\Classes\snapview.jpeg"; ValueType: string; ValueData: "JPEG image"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\snapview.jpeg"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "JPEG image"
-Root: HKA; Subkey: "Software\Classes\snapview.jpeg\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
 Root: HKA; Subkey: "Software\Classes\snapview.jpeg\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\.jpeg\OpenWithProgids"; ValueType: string; ValueName: "snapview.jpeg"; ValueData: ""; Flags: uninsdeletevalue
 ; .png
 Root: HKA; Subkey: "Software\Classes\snapview.png"; ValueType: string; ValueData: "PNG image"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\snapview.png"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "PNG image"
-Root: HKA; Subkey: "Software\Classes\snapview.png\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
 Root: HKA; Subkey: "Software\Classes\snapview.png\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\.png\OpenWithProgids"; ValueType: string; ValueName: "snapview.png"; ValueData: ""; Flags: uninsdeletevalue
 ; .bmp
 Root: HKA; Subkey: "Software\Classes\snapview.bmp"; ValueType: string; ValueData: "Bitmap image"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\snapview.bmp"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "Bitmap image"
-Root: HKA; Subkey: "Software\Classes\snapview.bmp\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
 Root: HKA; Subkey: "Software\Classes\snapview.bmp\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\.bmp\OpenWithProgids"; ValueType: string; ValueName: "snapview.bmp"; ValueData: ""; Flags: uninsdeletevalue
 ; .gif
 Root: HKA; Subkey: "Software\Classes\snapview.gif"; ValueType: string; ValueData: "GIF image"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\snapview.gif"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "GIF image"
-Root: HKA; Subkey: "Software\Classes\snapview.gif\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
 Root: HKA; Subkey: "Software\Classes\snapview.gif\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\.gif\OpenWithProgids"; ValueType: string; ValueName: "snapview.gif"; ValueData: ""; Flags: uninsdeletevalue
 ; .webp
 Root: HKA; Subkey: "Software\Classes\snapview.webp"; ValueType: string; ValueData: "WebP image"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\snapview.webp"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "WebP image"
-Root: HKA; Subkey: "Software\Classes\snapview.webp\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
 Root: HKA; Subkey: "Software\Classes\snapview.webp\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\.webp\OpenWithProgids"; ValueType: string; ValueName: "snapview.webp"; ValueData: ""; Flags: uninsdeletevalue
 ; .tif
 Root: HKA; Subkey: "Software\Classes\snapview.tif"; ValueType: string; ValueData: "TIFF image"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\snapview.tif"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "TIFF image"
-Root: HKA; Subkey: "Software\Classes\snapview.tif\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
 Root: HKA; Subkey: "Software\Classes\snapview.tif\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\.tif\OpenWithProgids"; ValueType: string; ValueName: "snapview.tif"; ValueData: ""; Flags: uninsdeletevalue
 ; .tiff
 Root: HKA; Subkey: "Software\Classes\snapview.tiff"; ValueType: string; ValueData: "TIFF image"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\snapview.tiff"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "TIFF image"
-Root: HKA; Subkey: "Software\Classes\snapview.tiff\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
 Root: HKA; Subkey: "Software\Classes\snapview.tiff\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\.tiff\OpenWithProgids"; ValueType: string; ValueName: "snapview.tiff"; ValueData: ""; Flags: uninsdeletevalue
 
