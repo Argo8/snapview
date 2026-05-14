@@ -1884,10 +1884,53 @@ fn draw_chevron(painter: &egui::Painter, rect: egui::Rect, hovered: bool, points
 }
 
 fn is_image(p: &Path) -> bool {
-    p.extension()
-        .and_then(|s| s.to_str())
-        .map(|s| SUPPORTED_EXTS.iter().any(|e| e.eq_ignore_ascii_case(s)))
-        .unwrap_or(false)
+    if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+        return SUPPORTED_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext));
+    }
+    // Some cameras (and renames) drop the extension entirely. Peek a few
+    // bytes and accept files whose header matches one of our supported
+    // formats. Files with any extension (even an unknown one) are NOT
+    // sniffed — that keeps folder-scan I/O bounded and avoids false
+    // positives on .txt/.json that happen to start with binary noise.
+    has_supported_magic(p)
+}
+
+fn has_supported_magic(p: &Path) -> bool {
+    use std::io::Read;
+    let f = match std::fs::File::open(p) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut head = [0u8; 12];
+    let n = std::io::BufReader::new(f).read(&mut head).unwrap_or(0);
+    if n < 4 {
+        return false;
+    }
+    // JPEG: FF D8 FF
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return true;
+    }
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if head.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        return true;
+    }
+    // GIF: GIF87a / GIF89a
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return true;
+    }
+    // BMP: BM
+    if head.starts_with(b"BM") {
+        return true;
+    }
+    // WebP: RIFF....WEBP
+    if n >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return true;
+    }
+    // TIFF: II*\0 (LE) or MM\0* (BE)
+    if head.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || head.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+        return true;
+    }
+    false
 }
 
 fn is_raw_sidecar(p: &Path) -> bool {
