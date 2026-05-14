@@ -86,6 +86,7 @@ struct PendingActions {
     rot_right: bool,
     toggle_fav: bool,
     open_folder: bool,
+    open_recent: Option<PathBuf>,
     toggle_max: bool,
     quit: bool,
     open_filter: bool,
@@ -126,14 +127,15 @@ impl ThemeMode {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Preferences {
     theme: ThemeMode,
+    recent: Vec<PathBuf>,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
-        Self { theme: ThemeMode::Auto }
+        Self { theme: ThemeMode::Auto, recent: Vec::new() }
     }
 }
 
@@ -453,6 +455,7 @@ impl SnapView {
         }
 
         self.folder = Some(folder.to_path_buf());
+        self.record_recent_folder(folder);
         self.favorites = load_favorites(folder, &images);
         self.images = images;
         self.sidecars = sidecars;
@@ -668,6 +671,17 @@ impl SnapView {
     /// the file inside its folder; macOS `open -R path` does the same;
     /// Linux falls back to `xdg-open <folder>` since there's no portable way
     /// to highlight a specific file.
+    /// Push the just-opened folder to the front of the recents list, dedupe,
+    /// cap at MAX_RECENT, and persist preferences.
+    fn record_recent_folder(&mut self, folder: &Path) {
+        const MAX_RECENT: usize = 10;
+        let f = folder.to_path_buf();
+        self.prefs.recent.retain(|p| p != &f);
+        self.prefs.recent.insert(0, f);
+        self.prefs.recent.truncate(MAX_RECENT);
+        let _ = save_preferences(&self.prefs);
+    }
+
     fn show_current_in_file_manager(&mut self) {
         let Some(path) = self.current_path() else { return };
         let res = if cfg!(target_os = "windows") {
@@ -1390,6 +1404,16 @@ impl eframe::App for SnapView {
                 self.open_folder(&d, None);
             }
         }
+        if let Some(d) = actions.open_recent {
+            if d.is_dir() {
+                self.open_folder(&d, None);
+            } else {
+                // Folder is gone — drop it from recents and surface why.
+                self.prefs.recent.retain(|p| p != &d);
+                let _ = save_preferences(&self.prefs);
+                self.filter_msg = Some((format!("Folder no longer exists: {}", d.display()), 2.5));
+            }
+        }
         if actions.toggle_max {
             self.is_fullscreen = !self.is_fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
@@ -1435,18 +1459,72 @@ impl eframe::App for SnapView {
 }
 
 impl SnapView {
+    /// Empty-state view: title, a "Choose folder…" primary button, hint about
+    /// Ctrl+O / drag-drop, and a recent-folders list when we have any saved.
+    fn render_empty_state(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_rect_before_wrap();
+        let card_w = 460.0_f32.min(avail.width() - 40.0);
+        let card_x = avail.center().x - card_w * 0.5;
+        let card_y = (avail.center().y - 180.0).max(avail.top() + 20.0);
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(
+                    egui::pos2(card_x, card_y),
+                    egui::vec2(card_w, avail.bottom() - card_y - 20.0),
+                ))
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+        child.add_space(10.0);
+        child.label(egui::RichText::new("snapview").size(28.0).strong());
+        child.label(
+            egui::RichText::new("Drop a folder or image · Ctrl+O to choose")
+                .color(egui::Color32::from_gray(140))
+                .size(13.0),
+        );
+        child.add_space(18.0);
+        if child
+            .add_sized([220.0, 32.0], egui::Button::new("Choose folder…"))
+            .clicked()
+        {
+            self.actions.open_folder = true;
+        }
+        child.add_space(18.0);
+
+        if !self.prefs.recent.is_empty() {
+            child.separator();
+            child.add_space(6.0);
+            child.label(
+                egui::RichText::new("Recent")
+                    .color(egui::Color32::from_gray(160))
+                    .size(12.0),
+            );
+            child.add_space(4.0);
+            let recents = self.prefs.recent.clone();
+            for p in &recents {
+                let label = recent_label(p);
+                let resp = child.add(
+                    egui::Button::new(
+                        egui::RichText::new(label)
+                            .size(13.0)
+                            .color(egui::Color32::from_gray(220)),
+                    )
+                    .frame(false)
+                    .min_size(egui::vec2(card_w - 20.0, 22.0)),
+                );
+                if resp.clicked() {
+                    self.actions.open_recent = Some(p.clone());
+                }
+                resp.on_hover_text(p.display().to_string());
+            }
+        }
+    }
+
     fn render_image(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
         let path = match self.current_path() {
             Some(p) => p,
             None => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new("Drop a folder or image here\nor press Ctrl+O")
-                            .color(egui::Color32::from_gray(140))
-                            .size(20.0),
-                    );
-                });
+                self.render_empty_state(ui);
                 self.handle_drop(ctx);
                 return;
             }
@@ -1864,10 +1942,25 @@ impl SnapView {
         let fav_total = self.favorites.len();
         let filter_label = self.filter_mode.label();
 
+        let recents = self.prefs.recent.clone();
         resp.context_menu(|ui| {
             if ui.button("Open folder…  (Ctrl+O)").clicked() {
                 self.actions.open_folder = true;
                 ui.close_menu();
+            }
+            if !recents.is_empty() {
+                ui.menu_button("Recent folders", |ui| {
+                    for p in &recents {
+                        if ui
+                            .button(recent_label(p))
+                            .on_hover_text(p.display().to_string())
+                            .clicked()
+                        {
+                            self.actions.open_recent = Some(p.clone());
+                            ui.close_menu();
+                        }
+                    }
+                });
             }
             ui.separator();
             if ui.button("Rotate left  (Q)").clicked() { self.actions.rot_left = true; ui.close_menu(); }
@@ -2302,6 +2395,31 @@ fn draw_chevron(painter: &egui::Painter, rect: egui::Rect, hovered: bool, points
 
 fn file_label(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// Compact one-line label for a recent-folder entry: the last two path
+/// segments ("Photos / 2024-08") so similarly-named folders are
+/// distinguishable without showing the whole absolute path.
+fn recent_label(p: &Path) -> String {
+    let segs: Vec<String> = p
+        .components()
+        .rev()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .take(2)
+        .collect();
+    if segs.is_empty() {
+        p.display().to_string()
+    } else if segs.len() == 1 {
+        segs.into_iter().next().unwrap()
+    } else {
+        let mut it = segs.into_iter();
+        let last = it.next().unwrap();
+        let parent = it.next().unwrap();
+        format!("{} / {}", parent, last)
+    }
 }
 
 fn is_image(p: &Path) -> bool {
@@ -3045,6 +3163,12 @@ fn load_preferences() -> Option<Preferences> {
                         prefs.theme = t;
                     }
                 }
+                "recent" => {
+                    let p = PathBuf::from(v);
+                    if !p.as_os_str().is_empty() && prefs.recent.iter().all(|x| x != &p) {
+                        prefs.recent.push(p);
+                    }
+                }
                 _ => {}
             }
         }
@@ -3059,10 +3183,10 @@ fn save_preferences(prefs: &Preferences) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = format!(
-        "# snapview preferences\ntheme={}\n",
-        prefs.theme.as_str()
-    );
+    let mut content = format!("# snapview preferences\ntheme={}\n", prefs.theme.as_str());
+    for p in &prefs.recent {
+        content.push_str(&format!("recent={}\n", p.display()));
+    }
     let mut tmp = path.clone();
     let name = match path.file_name().and_then(|s| s.to_str()) {
         Some(n) => format!("{}.tmp", n),
