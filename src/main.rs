@@ -3,7 +3,7 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -141,6 +141,11 @@ struct SnapView {
     full_q: Arc<PrioQueue>,
     thumb_q: Arc<PrioQueue>,
     hq_mode: Arc<AtomicBool>,
+    /// Bumped on every folder open. Decoder threads read it at the start of
+    /// each job and tag their JobResult with the value; drain_results drops
+    /// results whose generation no longer matches, so leftover work from a
+    /// previously-open folder can't poison the new folder's cache.
+    current_generation: Arc<AtomicU64>,
     zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>>,
     result_rx: mpsc::Receiver<JobResult>,
 
@@ -179,8 +184,8 @@ struct TouchSwipe {
 }
 
 enum JobResult {
-    Full(PathBuf, LoadedImage, i32),
-    Thumb(PathBuf, LoadedImage, Option<[usize; 2]>, i32),
+    Full(u64, PathBuf, LoadedImage, i32),
+    Thumb(u64, PathBuf, LoadedImage, Option<[usize; 2]>, i32),
 }
 
 struct PrioQueueInner {
@@ -264,6 +269,7 @@ impl SnapView {
         let thumb_q = PrioQueue::new();
         let hq_mode = Arc::new(AtomicBool::new(false));
         let zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let current_generation = Arc::new(AtomicU64::new(0));
 
         let total = num_workers();
         let n_full = (total / 2).max(2);
@@ -275,13 +281,15 @@ impl SnapView {
             let ctx = cc.egui_ctx.clone();
             let hq = Arc::clone(&hq_mode);
             let zoom_hq = Arc::clone(&zoom_hq_paths);
+            let gen = Arc::clone(&current_generation);
             thread::spawn(move || loop {
                 let path = match q.pop() { Some(p) => p, None => break };
+                let job_gen = gen.load(Ordering::Relaxed);
                 let need_hq = hq.load(Ordering::Relaxed)
                     || zoom_hq.lock().unwrap().contains(&path);
                 let target = if need_hq { HQ_MAX_DIM } else { FULL_MAX_DIM };
                 let (r, q) = decode_image_to(&path, target);
-                let _ = tx.send(JobResult::Full(path, r, q));
+                let _ = tx.send(JobResult::Full(job_gen, path, r, q));
                 ctx.request_repaint();
             });
         }
@@ -289,10 +297,12 @@ impl SnapView {
             let q = Arc::clone(&thumb_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
+            let gen = Arc::clone(&current_generation);
             thread::spawn(move || loop {
                 let path = match q.pop() { Some(p) => p, None => break };
+                let job_gen = gen.load(Ordering::Relaxed);
                 let (r, dims, qrt) = decode_thumb(&path);
-                let _ = tx.send(JobResult::Thumb(path, r, dims, qrt));
+                let _ = tx.send(JobResult::Thumb(job_gen, path, r, dims, qrt));
                 ctx.request_repaint();
             });
         }
@@ -313,6 +323,7 @@ impl SnapView {
             full_q,
             thumb_q,
             hq_mode,
+            current_generation,
             zoom_hq_paths,
             result_rx,
             show_filter: false,
@@ -394,6 +405,9 @@ impl SnapView {
 
         self.thumb_q.clear();
         self.full_q.clear();
+        // Bump the generation so any in-flight decodes from the previous
+        // folder are dropped on arrival in drain_results.
+        self.current_generation.fetch_add(1, Ordering::Relaxed);
 
         let n = self.images.len();
         let cur = if let Some(sel) = &select {
@@ -469,9 +483,22 @@ impl SnapView {
     }
 
     fn drain_results(&mut self, ctx: &egui::Context) {
+        let cur_gen = self.current_generation.load(Ordering::Relaxed);
         while let Ok(res) = self.result_rx.try_recv() {
+            // Drop anything that was decoded for a previous folder open. The
+            // PathBuf coming back may collide with a same-named file in the
+            // current folder, so without this guard a stale decode would
+            // silently overwrite the new folder's cache and the wrong pixels
+            // would flash on screen.
+            let job_gen = match &res {
+                JobResult::Full(g, ..) => *g,
+                JobResult::Thumb(g, ..) => *g,
+            };
+            if job_gen != cur_gen {
+                continue;
+            }
             match res {
-                JobResult::Full(path, result, exif_q) => {
+                JobResult::Full(_, path, result, exif_q) => {
                     self.exif_quarter.insert(path.clone(), exif_q);
                     let mut cache = self.cache.lock().unwrap();
                     cache.insert(path.clone(), result.clone());
@@ -496,7 +523,7 @@ impl SnapView {
                         }
                     }
                 }
-                JobResult::Thumb(path, result, dims, exif_q) => {
+                JobResult::Thumb(_, path, result, dims, exif_q) => {
                     self.exif_quarter.entry(path.clone()).or_insert(exif_q);
                     let mut tc = self.thumb_cache.lock().unwrap();
                     tc.insert(path.clone(), result.clone());
