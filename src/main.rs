@@ -680,9 +680,7 @@ impl SnapView {
         }
         let was_fav = self.favorites.remove(&path);
         if was_fav {
-            if let Some(folder) = &self.folder {
-                save_favorites(folder, &self.favorites);
-            }
+            self.persist_favorites();
         }
         self.cache.lock().unwrap().remove(&path);
         self.thumb_cache.lock().unwrap().remove(&path);
@@ -747,8 +745,16 @@ impl SnapView {
         };
         if self.favorites.contains(&p) { self.favorites.remove(&p); }
         else { self.favorites.insert(p); }
-        if let Some(folder) = &self.folder {
-            save_favorites(folder, &self.favorites);
+        self.persist_favorites();
+    }
+
+    /// Save favorites to disk, surfacing any I/O error as a transient toast
+    /// instead of silently dropping it (read-only volumes, full disk, locked
+    /// file on Windows, …).
+    fn persist_favorites(&mut self) {
+        let Some(folder) = self.folder.clone() else { return };
+        if let Err(e) = save_favorites(&folder, &self.favorites) {
+            self.filter_msg = Some((format!("Couldn't save favorites: {}", e), 3.0));
         }
     }
 
@@ -939,9 +945,7 @@ impl SnapView {
             self.full_dims.remove(p);
         }
         self.images.retain(|p| !moved.contains(p));
-        if let Some(folder) = &self.folder {
-            save_favorites(folder, &self.favorites);
-        }
+        self.persist_favorites();
         if self.images.is_empty() {
             self.current = 0;
         } else {
@@ -2459,7 +2463,7 @@ fn load_favorites(folder: &Path, available: &[PathBuf]) -> HashSet<PathBuf> {
     set
 }
 
-fn save_favorites(folder: &Path, favs: &HashSet<PathBuf>) {
+fn save_favorites(folder: &Path, favs: &HashSet<PathBuf>) -> std::io::Result<()> {
     let path = favorites_path(folder);
     let mut names: Vec<String> = favs
         .iter()
@@ -2478,16 +2482,23 @@ fn save_favorites(folder: &Path, favs: &HashSet<PathBuf>) {
     let mut tmp = path.clone();
     let new_name = match path.file_name().and_then(|s| s.to_str()) {
         Some(n) => format!("{}.tmp", n),
-        None => return,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "favorites path has no file name",
+            ));
+        }
     };
     tmp.set_file_name(new_name);
-    if std::fs::write(&tmp, content.as_bytes()).is_err() {
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
-        return;
+        return Err(e);
     }
-    if std::fs::rename(&tmp, &path).is_err() {
+    if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
+    Ok(())
 }
 
 fn num_workers() -> usize {
