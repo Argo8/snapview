@@ -161,3 +161,24 @@ Root: HKA; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: st
 Root: HKA; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tif"; ValueData: "snapview.tif"
 Root: HKA; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tiff"; ValueData: "snapview.tiff"
 Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: "{#MyVendorKey}\Capabilities"; Flags: uninsdeletevalue
+
+; Tell Explorer to refresh file associations immediately on install/uninstall
+; (otherwise the new ProgIDs only show up in 'Open with' after a logoff).
+[Code]
+const
+  SHCNE_ASSOCCHANGED = $08000000;
+  SHCNF_IDLIST = $0000;
+procedure SHChangeNotify(wEventId: Cardinal; uFlags: Cardinal; dwItem1, dwItem2: Cardinal);
+  external 'SHChangeNotify@shell32.dll stdcall';
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
+end;
