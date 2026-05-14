@@ -168,6 +168,10 @@ struct SnapView {
     pending_delete: Option<PathBuf>,
     last_image_rect: Option<egui::Rect>,
     displayed_path: Option<PathBuf>,
+    /// +1 when the user was last navigating forward, -1 backward. Used by
+    /// queue_preload / prioritize_thumbs to skew the preload window in the
+    /// direction the user is most likely to keep flicking.
+    nav_direction: i8,
 
     zoom: f32,
     target_zoom: f32,
@@ -343,6 +347,7 @@ impl SnapView {
             pending_delete: None,
             last_image_rect: None,
             displayed_path: None,
+            nav_direction: 1,
             zoom: 1.0,
             target_zoom: 1.0,
             pan: egui::Vec2::ZERO,
@@ -406,6 +411,7 @@ impl SnapView {
         self.rotation.clear();
         self.zoom_hq_paths.lock().unwrap().clear();
         self.displayed_path = None;
+        self.nav_direction = 1;
 
         self.thumb_q.clear();
         self.full_q.clear();
@@ -441,17 +447,47 @@ impl SnapView {
         self.prioritize_thumbs();
     }
 
+    /// Build a list of nearby images ordered by directional priority. The
+    /// returned vec starts with the current image, then biases ahead in the
+    /// user's nav_direction: it interleaves the forward half first, slips a
+    /// single backward image in, finishes the rest of the forward window,
+    /// then the deeper backward window. Net effect: the preload pipeline
+    /// always reads ahead in the direction the user is moving, so flicking
+    /// past 3-4 photos in a row never stalls on a decode, while a sudden
+    /// reverse still has one image ready.
+    fn directional_neighbors(&self, radius: usize) -> Vec<PathBuf> {
+        let n = self.images.len();
+        let cur = self.current as i64;
+        let dir = self.nav_direction as i64;
+        let half = (radius + 1) / 2;
+        let mut offsets: Vec<i64> = Vec::with_capacity(radius * 2 + 1);
+        offsets.push(0);
+        for d in 1..=half {
+            offsets.push(d as i64);
+        }
+        if radius >= 1 {
+            offsets.push(-1);
+        }
+        for d in (half + 1)..=radius {
+            offsets.push(d as i64);
+        }
+        for d in 2..=radius {
+            offsets.push(-(d as i64));
+        }
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(offsets.len());
+        for off in offsets {
+            let idx = cur + off * dir;
+            if idx >= 0 && (idx as usize) < n {
+                paths.push(self.images[idx as usize].clone());
+            }
+        }
+        paths
+    }
+
     fn prioritize_thumbs(&self) {
         if self.images.is_empty() { return; }
         const RADIUS: usize = 12;
-        let n = self.images.len();
-        let cur = self.current;
-        let mut paths: Vec<PathBuf> = Vec::with_capacity(RADIUS * 2 + 1);
-        paths.push(self.images[cur].clone());
-        for d in 1..=RADIUS {
-            if cur + d < n { paths.push(self.images[cur + d].clone()); }
-            if cur >= d { paths.push(self.images[cur - d].clone()); }
-        }
+        let paths = self.directional_neighbors(RADIUS);
         // Drop already-loaded ones from the priority list.
         let cache = self.thumb_cache.lock().unwrap();
         let pending: Vec<PathBuf> = paths
@@ -466,15 +502,7 @@ impl SnapView {
 
     fn queue_preload(&self) {
         if self.images.is_empty() { return; }
-        let n = self.images.len();
-        let cur = self.current;
-
-        let mut paths: Vec<PathBuf> = Vec::new();
-        paths.push(self.images[cur].clone());
-        for d in 1..=PRELOAD_RADIUS {
-            if cur + d < n { paths.push(self.images[cur + d].clone()); }
-            if cur >= d { paths.push(self.images[cur - d].clone()); }
-        }
+        let paths = self.directional_neighbors(PRELOAD_RADIUS);
         let cache = self.cache.lock().unwrap();
         let pending: Vec<PathBuf> = paths
             .into_iter()
@@ -608,6 +636,7 @@ impl SnapView {
         if self.images.is_empty() { return; }
         let n = self.images.len();
         if self.visible_count() == 0 { return; }
+        self.nav_direction = if forward { 1 } else { -1 };
         let mut idx = self.current;
         for _ in 0..n {
             idx = if forward {
