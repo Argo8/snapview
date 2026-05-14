@@ -218,6 +218,15 @@ impl PrioQueue {
         g.in_queue.clear();
     }
 
+    /// Mark the queue as closed and wake every waiter so workers can exit
+    /// their pop loop. Used from Drop to unwind decoder threads cleanly
+    /// instead of leaving them parked on the Condvar at process exit.
+    fn close(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.closed = true;
+        self.cv.notify_all();
+    }
+
     fn pop(&self) -> Option<PathBuf> {
         let mut g = self.inner.lock().unwrap();
         loop {
@@ -901,6 +910,17 @@ impl SnapView {
         }
         self.queue_preload();
         Ok(count)
+    }
+}
+
+impl Drop for SnapView {
+    fn drop(&mut self) {
+        // Wake the decoder threads so they can exit their blocking pop()
+        // loop. The threads detach naturally with the process, but closing
+        // explicitly avoids the zombie-on-restart case and quiets shutdown
+        // diagnostics from sanitizers.
+        self.full_q.close();
+        self.thumb_q.close();
     }
 }
 
