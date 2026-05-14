@@ -72,6 +72,27 @@ fn set_app_user_model_id(aumid: &str) {
     }
 }
 
+/// Notify the Windows shell that the user just opened a folder via our app.
+/// Populates the system "Recent items" list and, because we previously set
+/// an AppUserModelID, the per-app Jump List on the taskbar icon. SHARD_PATHW
+/// = 3, the wide-string-path variant of SHAddToRecentDocs.
+#[cfg(windows)]
+fn sh_add_to_recent_docs(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn SHAddToRecentDocs(uFlags: u32, pv: *const std::ffi::c_void);
+    }
+    const SHARD_PATHW: u32 = 3;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        SHAddToRecentDocs(SHARD_PATHW, wide.as_ptr() as *const std::ffi::c_void);
+    }
+}
+
 #[derive(Clone)]
 enum LoadedImage {
     Ready(Arc<egui::ColorImage>),
@@ -677,9 +698,13 @@ impl SnapView {
         const MAX_RECENT: usize = 10;
         let f = folder.to_path_buf();
         self.prefs.recent.retain(|p| p != &f);
-        self.prefs.recent.insert(0, f);
+        self.prefs.recent.insert(0, f.clone());
         self.prefs.recent.truncate(MAX_RECENT);
         let _ = save_preferences(&self.prefs);
+        // Tell Windows about it too — populates the OS "Recent items" list
+        // and the AppUserModelID-keyed Jump List under our taskbar icon.
+        #[cfg(windows)]
+        sh_add_to_recent_docs(&f);
     }
 
     fn show_current_in_file_manager(&mut self) {
