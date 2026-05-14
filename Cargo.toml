@@ -16,6 +16,7 @@ kamadak-exif = "0.6"
 trash = "5"
 jpeg-decoder = "0.3"
 lcms2 = "6"
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

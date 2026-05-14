@@ -189,6 +189,9 @@ struct SnapView {
     zoom_hq_paths: Arc<Mutex<VecDeque<PathBuf>>>,
     result_rx: mpsc::Receiver<JobResult>,
 
+    fs_watcher: Option<notify::RecommendedWatcher>,
+    fs_rx: Option<mpsc::Receiver<notify::Event>>,
+
     show_filter: bool,
     show_prefs: bool,
     show_help: bool,
@@ -376,6 +379,8 @@ impl SnapView {
             current_generation,
             zoom_hq_paths,
             result_rx,
+            fs_watcher: None,
+            fs_rx: None,
             show_filter: false,
             show_prefs: false,
             show_help: false,
@@ -463,6 +468,7 @@ impl SnapView {
 
         self.thumb_q.clear();
         self.full_q.clear();
+        self.start_fs_watch(folder);
         // Bump the generation so any in-flight decodes from the previous
         // folder are dropped on arrival in drain_results.
         self.current_generation.fetch_add(1, Ordering::Relaxed);
@@ -560,6 +566,131 @@ impl SnapView {
         if !pending.is_empty() {
             self.full_q.prioritize(&pending);
         }
+    }
+
+    /// (Re)start the filesystem watcher for the freshly-opened folder. Drops
+    /// any prior watcher (which stops watching the old path) and stands up a
+    /// fresh one that sends events into self.fs_rx. Failures (network
+    /// drives, permission denied) silently skip — the app keeps working,
+    /// the user just doesn't get auto-refresh.
+    fn start_fs_watch(&mut self, folder: &Path) {
+        use notify::Watcher;
+        self.fs_watcher = None;
+        self.fs_rx = None;
+        let (tx, rx) = mpsc::channel::<notify::Event>();
+        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                let _ = tx.send(ev);
+            }
+        }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        if watcher
+            .watch(folder, notify::RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return;
+        }
+        self.fs_watcher = Some(watcher);
+        self.fs_rx = Some(rx);
+    }
+
+    /// Pull all pending FS events and reconcile self.images with the changes.
+    /// Only fires for the current folder (NonRecursive); cross-folder moves
+    /// arrive as Create/Remove pairs.
+    fn drain_fs_events(&mut self) {
+        let folder = match self.folder.clone() {
+            Some(f) => f,
+            None => return,
+        };
+        let Some(rx) = self.fs_rx.as_ref() else { return };
+        let mut added: Vec<PathBuf> = Vec::new();
+        let mut removed: Vec<PathBuf> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            use notify::EventKind;
+            for p in event.paths {
+                // Ignore anything that isn't inside the active folder.
+                if p.parent() != Some(folder.as_path()) {
+                    continue;
+                }
+                match event.kind {
+                    EventKind::Create(_) => added.push(p),
+                    EventKind::Remove(_) => removed.push(p),
+                    EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                        // Rename: depending on platform we get one Modify
+                        // with two paths, or separate Create/Remove. Treat
+                        // any name event as a potential add/remove — we
+                        // check exists() below to disambiguate.
+                        if p.exists() { added.push(p); } else { removed.push(p); }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for p in removed {
+            self.handle_fs_remove(&p);
+        }
+        for p in added {
+            self.handle_fs_add(&p);
+        }
+    }
+
+    fn handle_fs_add(&mut self, path: &Path) {
+        if !path.is_file() { return; }
+        if !is_image(path) { return; }
+        if self.images.iter().any(|p| p == path) { return; }
+        let pb = path.to_path_buf();
+        // Keep self.images alphabetically sorted (matches the initial scan).
+        let pos = self.images.partition_point(|p| p < &pb);
+        self.images.insert(pos, pb.clone());
+        if pos <= self.current && !self.images.is_empty() {
+            // Insertion at or before current shifts current up by one to
+            // keep pointing at the same image the user was looking at.
+            if self.current < self.images.len() - 1 {
+                self.current += 1;
+            }
+        }
+        // Reload favorites from disk in case the user dropped a new file
+        // already listed there.
+        if let Some(folder) = &self.folder {
+            self.favorites = load_favorites(folder, &self.images);
+        }
+        self.queue_preload();
+        self.prioritize_thumbs();
+        self.filter_msg = Some((format!("Added: {}", file_label(path)), 1.5));
+    }
+
+    fn handle_fs_remove(&mut self, path: &Path) {
+        let idx = match self.images.iter().position(|p| p == path) {
+            Some(i) => i,
+            None => return,
+        };
+        let was_current = idx == self.current;
+        self.favorites.remove(path);
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(path);
+        self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(path);
+        self.textures.remove(path);
+        self.thumb_textures.remove(path);
+        self.rotation.remove(path);
+        self.exif_quarter.remove(path);
+        self.full_dims.remove(path);
+        self.sidecars.remove(path);
+        self.metadata_cache.remove(path);
+        self.images.remove(idx);
+        if idx < self.current {
+            self.current -= 1;
+        }
+        if self.images.is_empty() {
+            self.current = 0;
+        } else if self.current >= self.images.len() {
+            self.current = self.images.len() - 1;
+        }
+        if was_current {
+            self.queue_preload();
+            self.prioritize_thumbs();
+        }
+        self.filter_msg = Some((format!("Removed: {}", file_label(path)), 1.5));
     }
 
     fn drain_results(&mut self, ctx: &egui::Context) {
@@ -1066,6 +1197,7 @@ impl eframe::App for SnapView {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
         self.drain_results(ctx);
+        self.drain_fs_events();
 
         // Reset view when current image changes
         let cur_path = self.current_path();
@@ -2089,6 +2221,10 @@ fn draw_chevron(painter: &egui::Painter, rect: egui::Rect, hovered: bool, points
     let tip = egui::pos2(tip_x, mid_y);
     painter.line_segment([top, tip], stroke);
     painter.line_segment([bot, tip], stroke);
+}
+
+fn file_label(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
 }
 
 fn is_image(p: &Path) -> bool {
