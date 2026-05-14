@@ -29,6 +29,9 @@ const PRELOAD_RADIUS: usize = 3;
 const TEXTURE_CACHE_MAX: usize = 60;
 
 fn main() -> Result<(), eframe::Error> {
+    #[cfg(windows)]
+    set_app_user_model_id("FilipKozina.Snapview");
+
     let args: Vec<String> = std::env::args().collect();
     let initial_path = args.get(1).map(PathBuf::from);
 
@@ -53,6 +56,20 @@ fn main() -> Result<(), eframe::Error> {
         options,
         Box::new(|cc| Ok(Box::new(SnapView::new(cc, initial_path)))),
     )
+}
+
+/// Set an AppUserModelID so Windows can group our windows correctly in the
+/// taskbar and so 'Pin to taskbar' / jump lists / recent-files work. Must be
+/// called before any window is shown.
+#[cfg(windows)]
+fn set_app_user_model_id(aumid: &str) {
+    extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(app_id: *const u16) -> i32;
+    }
+    let wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(wide.as_ptr());
+    }
 }
 
 #[derive(Clone)]
