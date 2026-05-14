@@ -1,9 +1,12 @@
 ; snapview installer — Inno Setup script
 ; Build: ISCC.exe installer\snapview.iss
+;        ISCC.exe /DMyAppVersion=1.2.3 installer\snapview.iss   (CI override)
 ; Sign:  set SIGNTOOL to a signtool.exe command with cert/timestamp args before running ISCC.
 
 #define MyAppName "snapview"
-#define MyAppVersion "1.0.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.0"
+#endif
 #define MyAppPublisher "Filip Kozina"
 #define MyAppExeName "snapview.exe"
 #define MyAppId "{{B7F4C3E0-5E18-4D2D-9A4B-1A2F1E8A9D11}"
@@ -15,6 +18,14 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppCopyright=Copyright (C) 2026 {#MyAppPublisher}
+; VersionInfo* stamps setup.exe's Win32 file resource so Explorer's
+; Properties dialog, signtool, Add/Remove Programs, etc. see a consistent
+; version everywhere. VersionInfoVersion must be a 4-part numeric tag.
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppVersion}
+VersionInfoDescription={#MyAppName} installer
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
@@ -25,6 +36,12 @@ DisableProgramGroupPage=yes
 ; are possible. {autopf} / {group} / {autodesktop} / HKA all adapt to match.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog commandline
+; Smooth in-place upgrades: if snapview.exe is running, prompt the user to
+; close it, restart afterwards (or the installer aborts with a clear error
+; instead of failing on a locked file).
+CloseApplications=yes
+RestartApplications=yes
+CloseApplicationsFilter=*.exe,*.dll
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
 Compression=lzma2/ultra
