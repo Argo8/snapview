@@ -96,6 +96,7 @@ struct PendingActions {
     show_prefs: bool,
     request_hq: bool,
     toggle_help: bool,
+    toggle_metadata: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -191,6 +192,8 @@ struct SnapView {
     show_filter: bool,
     show_prefs: bool,
     show_help: bool,
+    show_metadata: bool,
+    metadata_cache: HashMap<PathBuf, Option<ImageMetadata>>,
     filter_selected: HashSet<PathBuf>,
 
     prefs: Preferences,
@@ -376,6 +379,8 @@ impl SnapView {
             show_filter: false,
             show_prefs: false,
             show_help: false,
+            show_metadata: false,
+            metadata_cache: HashMap::new(),
             filter_selected: HashSet::new(),
 
             prefs: load_preferences().unwrap_or_default(),
@@ -450,6 +455,7 @@ impl SnapView {
         self.thumb_textures.clear();
         self.full_dims.clear();
         self.exif_quarter.clear();
+        self.metadata_cache.clear();
         self.rotation.clear();
         self.zoom_hq_paths.lock().unwrap().clear();
         self.displayed_path = None;
@@ -1107,6 +1113,7 @@ impl eframe::App for SnapView {
                 if i.key_pressed(egui::Key::F11) { self.actions.toggle_max = true; }
                 if i.key_pressed(egui::Key::Enter) && i.modifiers.alt { self.actions.toggle_max = true; }
                 if i.key_pressed(egui::Key::F1) { self.actions.toggle_help = true; }
+                if i.key_pressed(egui::Key::I) { self.actions.toggle_metadata = true; }
             }
         });
 
@@ -1139,6 +1146,7 @@ impl eframe::App for SnapView {
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
             self.render_image(ui, ctx);
             self.render_overlay(ui);
+            self.render_metadata_overlay(ui);
             self.handle_background_interaction(ui, ctx);
             self.render_close_button(ui);
             self.render_nav_chevrons(ui);
@@ -1193,6 +1201,7 @@ impl eframe::App for SnapView {
         if actions.cancel_delete { self.pending_delete = None; }
         if actions.show_prefs { self.show_prefs = true; }
         if actions.toggle_help { self.show_help = !self.show_help; }
+        if actions.toggle_metadata { self.show_metadata = !self.show_metadata; }
         if actions.request_hq {
             // Global HQ mode toggle. We keep the existing low-res textures on
             // the GPU so the screen stays full while HQ decodes land in the
@@ -1428,6 +1437,69 @@ impl SnapView {
         }
     }
 
+    fn render_metadata_overlay(&mut self, ui: &mut egui::Ui) {
+        if !self.show_metadata { return; }
+        let path = match self.current_path() { Some(p) => p, None => return };
+        // Decode-on-demand cache. The EXIF read is fast (kamadak parses just
+        // the header) so doing it on the UI thread is fine — but we still
+        // cache to avoid repeating it every frame while the HUD is up.
+        if !self.metadata_cache.contains_key(&path) {
+            let md = read_image_metadata(&path);
+            self.metadata_cache.insert(path.clone(), if md.is_empty() { None } else { Some(md) });
+        }
+        let md = match self.metadata_cache.get(&path).cloned().flatten() {
+            Some(m) => m,
+            None => return,
+        };
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(s) = &md.date_taken { lines.push(s.clone()); }
+        if let Some(s) = &md.camera { lines.push(s.clone()); }
+        if let Some(s) = &md.lens { lines.push(s.clone()); }
+        let exposure: Vec<&str> = [&md.shutter, &md.aperture, &md.iso, &md.focal]
+            .iter()
+            .filter_map(|o| o.as_deref())
+            .collect();
+        if !exposure.is_empty() { lines.push(exposure.join("   ·   ")); }
+        let dims_size: Vec<&str> = [&md.dimensions, &md.file_size]
+            .iter()
+            .filter_map(|o| o.as_deref())
+            .collect();
+        if !dims_size.is_empty() { lines.push(dims_size.join("   ·   ")); }
+        if lines.is_empty() { return; }
+
+        let rect = if self.is_fullscreen {
+            ui.available_rect_before_wrap()
+        } else {
+            self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap())
+        };
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(13.0);
+        let pad = 12.0;
+        let line_h = 18.0;
+        let max_w = lines
+            .iter()
+            .map(|l| painter.layout_no_wrap(l.clone(), font.clone(), egui::Color32::WHITE).rect.width())
+            .fold(0.0_f32, f32::max);
+        let box_w = max_w + pad * 2.0;
+        let box_h = lines.len() as f32 * line_h + pad * 2.0;
+        let origin = egui::pos2(rect.left() + 14.0, rect.top() + 14.0);
+        let box_rect = egui::Rect::from_min_size(origin, egui::vec2(box_w, box_h));
+        painter.rect_filled(
+            box_rect,
+            8.0,
+            egui::Color32::from_rgba_premultiplied(0, 0, 0, 170),
+        );
+        for (i, line) in lines.iter().enumerate() {
+            painter.text(
+                egui::pos2(origin.x + pad, origin.y + pad + i as f32 * line_h),
+                egui::Align2::LEFT_TOP,
+                line,
+                font.clone(),
+                egui::Color32::from_rgba_premultiplied(240, 240, 240, 230),
+            );
+        }
+    }
+
     fn render_close_button(&mut self, ui: &mut egui::Ui) {
         if self.is_fullscreen { return; }
         let rect = self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap());
@@ -1619,6 +1691,8 @@ impl SnapView {
             };
             if ui.button(hq_label).clicked() { self.actions.request_hq = true; ui.close_menu(); }
             ui.separator();
+            let info_label = if self.show_metadata { "Hide image info  (I)" } else { "Show image info  (I)" };
+            if ui.button(info_label).clicked() { self.actions.toggle_metadata = true; ui.close_menu(); }
             if ui.button("Keyboard shortcuts  (F1)").clicked() { self.actions.toggle_help = true; ui.close_menu(); }
             if ui.button("Preferences…").clicked() { self.actions.show_prefs = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
@@ -1724,6 +1798,7 @@ impl SnapView {
             ("Zoom in / out", "Ctrl + scroll"),
             ("Reset zoom", "Num 0"),
             ("HQ mode (native)", "Z"),
+            ("Show / hide image info", "I"),
             ("Open folder…", "Ctrl + O"),
         ];
         let pairs_right: &[(&str, &str)] = &[
@@ -2422,6 +2497,148 @@ fn parse_tiff_for_metadata(f: &mut std::fs::File) -> Option<(Option<Vec<u8>>, u3
         _ => None,
     };
     Some((bytes, img_w, img_h, orient))
+}
+
+#[derive(Clone, Default)]
+struct ImageMetadata {
+    date_taken: Option<String>,
+    camera: Option<String>,
+    lens: Option<String>,
+    shutter: Option<String>,
+    aperture: Option<String>,
+    iso: Option<String>,
+    focal: Option<String>,
+    dimensions: Option<String>,
+    file_size: Option<String>,
+}
+
+impl ImageMetadata {
+    fn is_empty(&self) -> bool {
+        self.date_taken.is_none()
+            && self.camera.is_none()
+            && self.lens.is_none()
+            && self.shutter.is_none()
+            && self.aperture.is_none()
+            && self.iso.is_none()
+            && self.focal.is_none()
+            && self.dimensions.is_none()
+            && self.file_size.is_none()
+    }
+}
+
+fn read_image_metadata(path: &Path) -> ImageMetadata {
+    let mut m = ImageMetadata::default();
+    if let Ok(meta) = std::fs::metadata(path) {
+        m.file_size = Some(format_file_size(meta.len()));
+    }
+    if let Ok(f) = std::fs::File::open(path) {
+        let mut reader = std::io::BufReader::new(f);
+        if let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) {
+            use exif::{In, Tag};
+            let get_str = |tag: Tag| -> Option<String> {
+                exif.get_field(tag, In::PRIMARY).and_then(|f| {
+                    let s = f.display_value().to_string();
+                    let s = s.trim().trim_matches('"').to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                })
+            };
+            let get_rational = |tag: Tag| -> Option<(u32, u32)> {
+                let f = exif.get_field(tag, In::PRIMARY)?;
+                if let exif::Value::Rational(ref v) = f.value {
+                    v.first().map(|r| (r.num as u32, r.denom as u32))
+                } else {
+                    None
+                }
+            };
+            // Date taken — prefer DateTimeOriginal, fall back to DateTime.
+            m.date_taken = get_str(Tag::DateTimeOriginal)
+                .or_else(|| get_str(Tag::DateTime))
+                .map(prettify_exif_datetime);
+            // Camera body — "Make Model" if both, else either.
+            let make = get_str(Tag::Make);
+            let model = get_str(Tag::Model);
+            m.camera = match (make, model) {
+                (Some(mk), Some(md)) if md.starts_with(&mk) => Some(md),
+                (Some(mk), Some(md)) => Some(format!("{} {}", mk, md)),
+                (Some(mk), None) => Some(mk),
+                (None, Some(md)) => Some(md),
+                _ => None,
+            };
+            m.lens = get_str(Tag::LensModel);
+            // Shutter speed (ExposureTime) as a fraction "1/x" when num=1.
+            if let Some((n, d)) = get_rational(Tag::ExposureTime) {
+                if d != 0 {
+                    m.shutter = Some(if n == 1 {
+                        format!("1/{} s", d)
+                    } else if n > 0 && (n as f64) / (d as f64) < 1.0 {
+                        format!("1/{} s", (d as f64 / n as f64).round() as u64)
+                    } else {
+                        format!("{:.1} s", n as f64 / d as f64)
+                    });
+                }
+            }
+            if let Some((n, d)) = get_rational(Tag::FNumber) {
+                if d != 0 {
+                    m.aperture = Some(format!("f/{:.1}", n as f64 / d as f64));
+                }
+            }
+            if let Some(iso) = get_str(Tag::PhotographicSensitivity).or_else(|| get_str(Tag::ISOSpeed)) {
+                m.iso = Some(format!("ISO {}", iso));
+            }
+            if let Some((n, d)) = get_rational(Tag::FocalLength) {
+                if d != 0 {
+                    m.focal = Some(format!("{} mm", (n as f64 / d as f64).round() as u64));
+                }
+            }
+            // Pixel dimensions from EXIF if present.
+            let pw = exif
+                .get_field(Tag::PixelXDimension, In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0));
+            let ph = exif
+                .get_field(Tag::PixelYDimension, In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0));
+            if let (Some(w), Some(h)) = (pw, ph) {
+                m.dimensions = Some(format!("{} × {}", w, h));
+            }
+        }
+    }
+    // Fallback dimensions from JPEG SOF when EXIF didn't carry them.
+    if m.dimensions.is_none() {
+        if let Some((_, w, h, _)) = read_jpeg_exif_metadata(path) {
+            if w > 0 && h > 0 {
+                m.dimensions = Some(format!("{} × {}", w, h));
+            }
+        }
+    }
+    m
+}
+
+fn prettify_exif_datetime(s: String) -> String {
+    // EXIF uses "YYYY:MM:DD HH:MM:SS". Replace the date colons with dashes
+    // so it reads more naturally; leave the time portion alone.
+    let bytes = s.as_bytes();
+    if bytes.len() >= 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {
+        format!(
+            "{}-{}-{} {}",
+            &s[0..4],
+            &s[5..7],
+            &s[8..10],
+            &s[11..]
+        )
+    } else {
+        s
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB { format!("{:.2} GB", b / GB) }
+    else if b >= MB { format!("{:.1} MB", b / MB) }
+    else if b >= KB { format!("{:.0} KB", b / KB) }
+    else { format!("{} B", bytes) }
 }
 
 fn read_exif_orientation(path: &Path) -> Option<u32> {
