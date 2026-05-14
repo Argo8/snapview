@@ -72,17 +72,26 @@ jobs:
         env:
           WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
         run: |
+          # Derive the installer version from the pushed tag (v1.2.3 -> 1.2.3)
+          # when this is a tag build, otherwise fall back to the literal
+          # define inside the .iss file. Use a PowerShell array so the
+          # empty case doesn't pass a bogus empty argument to ISCC.
+          $extraArgs = @()
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $ver = $env:GITHUB_REF -replace "^refs/tags/v",""
+            $extraArgs += "/DMyAppVersion=$ver"
+          }
           if (Test-Path cert.pfx) {
             $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
             $pfx = (Resolve-Path cert.pfx).Path
             $signCmd = "`"$signtool`" sign /f `"$pfx`" /p $env:WINDOWS_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `$f"
-            & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/Ssigntool=$signCmd" installer/snapview.iss
+            & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/Ssigntool=$signCmd" @extraArgs installer/snapview.iss
           } else {
             (Get-Content installer/snapview.iss) `
               -replace '^SignTool=signtool', '; SignTool=signtool' `
               -replace '^SignedUninstaller=yes', '; SignedUninstaller=yes' `
               | Set-Content installer/snapview.iss
-            & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/snapview.iss
+            & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" @extraArgs installer/snapview.iss
           }
 
       - name: Upload artifacts

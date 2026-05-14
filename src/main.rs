@@ -3,7 +3,7 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -29,6 +29,9 @@ const PRELOAD_RADIUS: usize = 3;
 const TEXTURE_CACHE_MAX: usize = 60;
 
 fn main() -> Result<(), eframe::Error> {
+    #[cfg(windows)]
+    set_app_user_model_id("FilipKozina.Snapview");
+
     let args: Vec<String> = std::env::args().collect();
     let initial_path = args.get(1).map(PathBuf::from);
 
@@ -55,6 +58,41 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
+/// Set an AppUserModelID so Windows can group our windows correctly in the
+/// taskbar and so 'Pin to taskbar' / jump lists / recent-files work. Must be
+/// called before any window is shown.
+#[cfg(windows)]
+fn set_app_user_model_id(aumid: &str) {
+    extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(app_id: *const u16) -> i32;
+    }
+    let wide: Vec<u16> = aumid.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(wide.as_ptr());
+    }
+}
+
+/// Notify the Windows shell that the user just opened a folder via our app.
+/// Populates the system "Recent items" list and, because we previously set
+/// an AppUserModelID, the per-app Jump List on the taskbar icon. SHARD_PATHW
+/// = 3, the wide-string-path variant of SHAddToRecentDocs.
+#[cfg(windows)]
+fn sh_add_to_recent_docs(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn SHAddToRecentDocs(uFlags: u32, pv: *const std::ffi::c_void);
+    }
+    const SHARD_PATHW: u32 = 3;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        SHAddToRecentDocs(SHARD_PATHW, wide.as_ptr() as *const std::ffi::c_void);
+    }
+}
+
 #[derive(Clone)]
 enum LoadedImage {
     Ready(Arc<egui::ColorImage>),
@@ -69,6 +107,7 @@ struct PendingActions {
     rot_right: bool,
     toggle_fav: bool,
     open_folder: bool,
+    open_recent: Option<PathBuf>,
     toggle_max: bool,
     quit: bool,
     open_filter: bool,
@@ -76,8 +115,49 @@ struct PendingActions {
     delete: bool,
     confirm_delete: bool,
     cancel_delete: bool,
-    show_about: bool,
+    show_prefs: bool,
     request_hq: bool,
+    toggle_help: bool,
+    toggle_metadata: bool,
+    show_in_explorer: bool,
+    copy_to_clipboard: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeMode {
+    Auto,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ThemeMode::Auto => "auto",
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "auto" => Some(ThemeMode::Auto),
+            "light" => Some(ThemeMode::Light),
+            "dark" => Some(ThemeMode::Dark),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Preferences {
+    theme: ThemeMode,
+    recent: Vec<PathBuf>,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self { theme: ThemeMode::Auto, recent: Vec::new() }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,17 +203,33 @@ struct SnapView {
     full_q: Arc<PrioQueue>,
     thumb_q: Arc<PrioQueue>,
     hq_mode: Arc<AtomicBool>,
-    zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Bumped on every folder open. Decoder threads read it at the start of
+    /// each job and tag their JobResult with the value; drain_results drops
+    /// results whose generation no longer matches, so leftover work from a
+    /// previously-open folder can't poison the new folder's cache.
+    current_generation: Arc<AtomicU64>,
+    /// Recently zoom-promoted images. Bounded FIFO (most recent at the back);
+    /// workers consult this in addition to hq_mode to decide whether to decode
+    /// at HQ. Small cap keeps the GPU-resident HQ texture footprint sane.
+    zoom_hq_paths: Arc<Mutex<VecDeque<PathBuf>>>,
     result_rx: mpsc::Receiver<JobResult>,
 
+    fs_watcher: Option<notify::RecommendedWatcher>,
+    fs_rx: Option<mpsc::Receiver<notify::Event>>,
+
     show_filter: bool,
-    show_about: bool,
+    show_prefs: bool,
+    show_help: bool,
+    show_metadata: bool,
+    metadata_cache: HashMap<PathBuf, Option<ImageMetadata>>,
     filter_selected: HashSet<PathBuf>,
+
+    prefs: Preferences,
+    applied_light: Option<bool>,
 
     is_fullscreen: bool,
     last_resized_path: Option<PathBuf>,
     last_aspect_class: Option<i8>,
-    resize_paint_skip: u8,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -141,6 +237,11 @@ struct SnapView {
 
     pending_delete: Option<PathBuf>,
     last_image_rect: Option<egui::Rect>,
+    displayed_path: Option<PathBuf>,
+    /// +1 when the user was last navigating forward, -1 backward. Used by
+    /// queue_preload / prioritize_thumbs to skew the preload window in the
+    /// direction the user is most likely to keep flicking.
+    nav_direction: i8,
 
     zoom: f32,
     target_zoom: f32,
@@ -160,8 +261,8 @@ struct TouchSwipe {
 }
 
 enum JobResult {
-    Full(PathBuf, LoadedImage, i32),
-    Thumb(PathBuf, LoadedImage, Option<[usize; 2]>, i32),
+    Full(u64, PathBuf, LoadedImage, i32),
+    Thumb(u64, PathBuf, LoadedImage, Option<[usize; 2]>, i32),
 }
 
 struct PrioQueueInner {
@@ -188,7 +289,7 @@ impl PrioQueue {
     }
 
     fn enqueue_back(&self, paths: &[PathBuf]) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for p in paths {
             if g.in_queue.insert(p.clone()) {
                 g.queue.push_back(p.clone());
@@ -198,7 +299,7 @@ impl PrioQueue {
     }
 
     fn prioritize(&self, paths: &[PathBuf]) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for p in paths.iter().rev() {
             if let Some(pos) = g.queue.iter().position(|x| x == p) {
                 g.queue.remove(pos);
@@ -211,20 +312,29 @@ impl PrioQueue {
     }
 
     fn clear(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.queue.clear();
         g.in_queue.clear();
     }
 
+    /// Mark the queue as closed and wake every waiter so workers can exit
+    /// their pop loop. Used from Drop to unwind decoder threads cleanly
+    /// instead of leaving them parked on the Condvar at process exit.
+    fn close(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.closed = true;
+        self.cv.notify_all();
+    }
+
     fn pop(&self) -> Option<PathBuf> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(p) = g.queue.pop_front() {
                 g.in_queue.remove(&p);
                 return Some(p);
             }
             if g.closed { return None; }
-            g = self.cv.wait(g).unwrap();
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -235,7 +345,9 @@ impl SnapView {
         let full_q = PrioQueue::new();
         let thumb_q = PrioQueue::new();
         let hq_mode = Arc::new(AtomicBool::new(false));
-        let zoom_hq_paths: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let zoom_hq_paths: Arc<Mutex<VecDeque<PathBuf>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let current_generation = Arc::new(AtomicU64::new(0));
 
         let total = num_workers();
         let n_full = (total / 2).max(2);
@@ -247,13 +359,15 @@ impl SnapView {
             let ctx = cc.egui_ctx.clone();
             let hq = Arc::clone(&hq_mode);
             let zoom_hq = Arc::clone(&zoom_hq_paths);
+            let gen = Arc::clone(&current_generation);
             thread::spawn(move || loop {
                 let path = match q.pop() { Some(p) => p, None => break };
+                let job_gen = gen.load(Ordering::Relaxed);
                 let need_hq = hq.load(Ordering::Relaxed)
-                    || zoom_hq.lock().unwrap().contains(&path);
+                    || zoom_hq.lock().unwrap_or_else(|e| e.into_inner()).contains(&path);
                 let target = if need_hq { HQ_MAX_DIM } else { FULL_MAX_DIM };
                 let (r, q) = decode_image_to(&path, target);
-                let _ = tx.send(JobResult::Full(path, r, q));
+                let _ = tx.send(JobResult::Full(job_gen, path, r, q));
                 ctx.request_repaint();
             });
         }
@@ -261,10 +375,12 @@ impl SnapView {
             let q = Arc::clone(&thumb_q);
             let tx = result_tx.clone();
             let ctx = cc.egui_ctx.clone();
+            let gen = Arc::clone(&current_generation);
             thread::spawn(move || loop {
                 let path = match q.pop() { Some(p) => p, None => break };
+                let job_gen = gen.load(Ordering::Relaxed);
                 let (r, dims, qrt) = decode_thumb(&path);
-                let _ = tx.send(JobResult::Thumb(path, r, dims, qrt));
+                let _ = tx.send(JobResult::Thumb(job_gen, path, r, dims, qrt));
                 ctx.request_repaint();
             });
         }
@@ -285,20 +401,30 @@ impl SnapView {
             full_q,
             thumb_q,
             hq_mode,
+            current_generation,
             zoom_hq_paths,
             result_rx,
+            fs_watcher: None,
+            fs_rx: None,
             show_filter: false,
-            show_about: false,
+            show_prefs: false,
+            show_help: false,
+            show_metadata: false,
+            metadata_cache: HashMap::new(),
             filter_selected: HashSet::new(),
+
+            prefs: load_preferences().unwrap_or_default(),
+            applied_light: None,
             is_fullscreen: false,
             last_resized_path: None,
             last_aspect_class: None,
-            resize_paint_skip: 0,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
             pending_delete: None,
             last_image_rect: None,
+            displayed_path: None,
+            nav_direction: 1,
             zoom: 1.0,
             target_zoom: 1.0,
             pan: egui::Vec2::ZERO,
@@ -350,20 +476,28 @@ impl SnapView {
         }
 
         self.folder = Some(folder.to_path_buf());
+        self.record_recent_folder(folder);
         self.favorites = load_favorites(folder, &images);
         self.images = images;
         self.sidecars = sidecars;
-        self.cache.lock().unwrap().clear();
-        self.thumb_cache.lock().unwrap().clear();
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.textures.clear();
         self.thumb_textures.clear();
         self.full_dims.clear();
         self.exif_quarter.clear();
+        self.metadata_cache.clear();
         self.rotation.clear();
-        self.zoom_hq_paths.lock().unwrap().clear();
+        self.zoom_hq_paths.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.displayed_path = None;
+        self.nav_direction = 1;
 
         self.thumb_q.clear();
         self.full_q.clear();
+        self.start_fs_watch(folder);
+        // Bump the generation so any in-flight decodes from the previous
+        // folder are dropped on arrival in drain_results.
+        self.current_generation.fetch_add(1, Ordering::Relaxed);
 
         let n = self.images.len();
         let cur = if let Some(sel) = &select {
@@ -393,19 +527,49 @@ impl SnapView {
         self.prioritize_thumbs();
     }
 
+    /// Build a list of nearby images ordered by directional priority. The
+    /// returned vec starts with the current image, then biases ahead in the
+    /// user's nav_direction: it interleaves the forward half first, slips a
+    /// single backward image in, finishes the rest of the forward window,
+    /// then the deeper backward window. Net effect: the preload pipeline
+    /// always reads ahead in the direction the user is moving, so flicking
+    /// past 3-4 photos in a row never stalls on a decode, while a sudden
+    /// reverse still has one image ready.
+    fn directional_neighbors(&self, radius: usize) -> Vec<PathBuf> {
+        let n = self.images.len();
+        let cur = self.current as i64;
+        let dir = self.nav_direction as i64;
+        let half = (radius + 1) / 2;
+        let mut offsets: Vec<i64> = Vec::with_capacity(radius * 2 + 1);
+        offsets.push(0);
+        for d in 1..=half {
+            offsets.push(d as i64);
+        }
+        if radius >= 1 {
+            offsets.push(-1);
+        }
+        for d in (half + 1)..=radius {
+            offsets.push(d as i64);
+        }
+        for d in 2..=radius {
+            offsets.push(-(d as i64));
+        }
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(offsets.len());
+        for off in offsets {
+            let idx = cur + off * dir;
+            if idx >= 0 && (idx as usize) < n {
+                paths.push(self.images[idx as usize].clone());
+            }
+        }
+        paths
+    }
+
     fn prioritize_thumbs(&self) {
         if self.images.is_empty() { return; }
         const RADIUS: usize = 12;
-        let n = self.images.len();
-        let cur = self.current;
-        let mut paths: Vec<PathBuf> = Vec::with_capacity(RADIUS * 2 + 1);
-        paths.push(self.images[cur].clone());
-        for d in 1..=RADIUS {
-            if cur + d < n { paths.push(self.images[cur + d].clone()); }
-            if cur >= d { paths.push(self.images[cur - d].clone()); }
-        }
+        let paths = self.directional_neighbors(RADIUS);
         // Drop already-loaded ones from the priority list.
-        let cache = self.thumb_cache.lock().unwrap();
+        let cache = self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner());
         let pending: Vec<PathBuf> = paths
             .into_iter()
             .filter(|p| !matches!(cache.get(p), Some(LoadedImage::Ready(_)) | Some(LoadedImage::Failed)))
@@ -418,16 +582,8 @@ impl SnapView {
 
     fn queue_preload(&self) {
         if self.images.is_empty() { return; }
-        let n = self.images.len();
-        let cur = self.current;
-
-        let mut paths: Vec<PathBuf> = Vec::new();
-        paths.push(self.images[cur].clone());
-        for d in 1..=PRELOAD_RADIUS {
-            if cur + d < n { paths.push(self.images[cur + d].clone()); }
-            if cur >= d { paths.push(self.images[cur - d].clone()); }
-        }
-        let cache = self.cache.lock().unwrap();
+        let paths = self.directional_neighbors(PRELOAD_RADIUS);
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let pending: Vec<PathBuf> = paths
             .into_iter()
             .filter(|p| !matches!(cache.get(p), Some(LoadedImage::Ready(_)) | Some(LoadedImage::Failed)))
@@ -438,12 +594,231 @@ impl SnapView {
         }
     }
 
+    /// (Re)start the filesystem watcher for the freshly-opened folder. Drops
+    /// any prior watcher (which stops watching the old path) and stands up a
+    /// fresh one that sends events into self.fs_rx. Failures (network
+    /// drives, permission denied) silently skip — the app keeps working,
+    /// the user just doesn't get auto-refresh.
+    fn start_fs_watch(&mut self, folder: &Path) {
+        use notify::Watcher;
+        self.fs_watcher = None;
+        self.fs_rx = None;
+        let (tx, rx) = mpsc::channel::<notify::Event>();
+        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                let _ = tx.send(ev);
+            }
+        }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        if watcher
+            .watch(folder, notify::RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return;
+        }
+        self.fs_watcher = Some(watcher);
+        self.fs_rx = Some(rx);
+    }
+
+    /// Pull all pending FS events and reconcile self.images with the changes.
+    /// Only fires for the current folder (NonRecursive); cross-folder moves
+    /// arrive as Create/Remove pairs.
+    fn drain_fs_events(&mut self) {
+        let folder = match self.folder.clone() {
+            Some(f) => f,
+            None => return,
+        };
+        let Some(rx) = self.fs_rx.as_ref() else { return };
+        let mut added: Vec<PathBuf> = Vec::new();
+        let mut removed: Vec<PathBuf> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            use notify::EventKind;
+            for p in event.paths {
+                // Ignore anything that isn't inside the active folder.
+                if p.parent() != Some(folder.as_path()) {
+                    continue;
+                }
+                match event.kind {
+                    EventKind::Create(_) => added.push(p),
+                    EventKind::Remove(_) => removed.push(p),
+                    EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                        // Rename: depending on platform we get one Modify
+                        // with two paths, or separate Create/Remove. Treat
+                        // any name event as a potential add/remove — we
+                        // check exists() below to disambiguate.
+                        if p.exists() { added.push(p); } else { removed.push(p); }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for p in removed {
+            self.handle_fs_remove(&p);
+        }
+        for p in added {
+            self.handle_fs_add(&p);
+        }
+    }
+
+    fn handle_fs_add(&mut self, path: &Path) {
+        if !path.is_file() { return; }
+        if !is_image(path) { return; }
+        if self.images.iter().any(|p| p == path) { return; }
+        let pb = path.to_path_buf();
+        // Keep self.images alphabetically sorted (matches the initial scan).
+        let pos = self.images.partition_point(|p| p < &pb);
+        self.images.insert(pos, pb.clone());
+        if pos <= self.current && !self.images.is_empty() {
+            // Insertion at or before current shifts current up by one to
+            // keep pointing at the same image the user was looking at.
+            if self.current < self.images.len() - 1 {
+                self.current += 1;
+            }
+        }
+        // Reload favorites from disk in case the user dropped a new file
+        // already listed there.
+        if let Some(folder) = &self.folder {
+            self.favorites = load_favorites(folder, &self.images);
+        }
+        self.queue_preload();
+        self.prioritize_thumbs();
+        self.filter_msg = Some((format!("Added: {}", file_label(path)), 1.5));
+    }
+
+    /// Open the platform file manager focused on the currently displayed
+    /// image. On Windows that's `explorer.exe /select,path` which highlights
+    /// the file inside its folder; macOS `open -R path` does the same;
+    /// Linux falls back to `xdg-open <folder>` since there's no portable way
+    /// to highlight a specific file.
+    /// Push the just-opened folder to the front of the recents list, dedupe,
+    /// cap at MAX_RECENT, and persist preferences.
+    fn record_recent_folder(&mut self, folder: &Path) {
+        const MAX_RECENT: usize = 10;
+        let f = folder.to_path_buf();
+        self.prefs.recent.retain(|p| p != &f);
+        self.prefs.recent.insert(0, f.clone());
+        self.prefs.recent.truncate(MAX_RECENT);
+        let _ = save_preferences(&self.prefs);
+        // Tell Windows about it too — populates the OS "Recent items" list
+        // and the AppUserModelID-keyed Jump List under our taskbar icon.
+        #[cfg(windows)]
+        sh_add_to_recent_docs(&f);
+    }
+
+    fn show_current_in_file_manager(&mut self) {
+        let Some(path) = self.current_path() else { return };
+        let res = if cfg!(target_os = "windows") {
+            std::process::Command::new("explorer.exe")
+                .arg(format!("/select,{}", path.display()))
+                .spawn()
+                .map(|_| ())
+        } else if cfg!(target_os = "macos") {
+            std::process::Command::new("open")
+                .arg("-R")
+                .arg(&path)
+                .spawn()
+                .map(|_| ())
+        } else {
+            let parent = path.parent().unwrap_or(Path::new("."));
+            std::process::Command::new("xdg-open")
+                .arg(parent)
+                .spawn()
+                .map(|_| ())
+        };
+        match res {
+            Ok(_) => self.filter_msg = Some(("Opened in file manager".to_string(), 1.2)),
+            Err(e) => self.filter_msg = Some((format!("Couldn't open file manager: {}", e), 2.5)),
+        }
+    }
+
+    /// Copy the currently displayed image (current full or thumb texture)
+    /// to the system clipboard as a raw bitmap. Anything with clipboard
+    /// support (Word, Photoshop, browsers, chat apps) accepts this.
+    fn copy_current_to_clipboard(&mut self) {
+        let Some(path) = self.current_path() else { return };
+        let ci = {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            match cache.get(&path) {
+                Some(LoadedImage::Ready(ci)) => Some(ci.clone()),
+                _ => None,
+            }
+        };
+        let ci = match ci {
+            Some(c) => c,
+            None => {
+                self.filter_msg = Some(("Image not loaded yet".to_string(), 1.5));
+                return;
+            }
+        };
+        let bytes: Vec<u8> = ci
+            .pixels
+            .iter()
+            .flat_map(|c| [c.r(), c.g(), c.b(), c.a()])
+            .collect();
+        let img = arboard::ImageData {
+            width: ci.size[0],
+            height: ci.size[1],
+            bytes: std::borrow::Cow::Owned(bytes),
+        };
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_image(img)) {
+            Ok(_) => self.filter_msg = Some(("Copied to clipboard".to_string(), 1.2)),
+            Err(e) => self.filter_msg = Some((format!("Clipboard error: {}", e), 2.5)),
+        }
+    }
+
+    fn handle_fs_remove(&mut self, path: &Path) {
+        let idx = match self.images.iter().position(|p| p == path) {
+            Some(i) => i,
+            None => return,
+        };
+        let was_current = idx == self.current;
+        self.favorites.remove(path);
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(path);
+        self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(path);
+        self.textures.remove(path);
+        self.thumb_textures.remove(path);
+        self.rotation.remove(path);
+        self.exif_quarter.remove(path);
+        self.full_dims.remove(path);
+        self.sidecars.remove(path);
+        self.metadata_cache.remove(path);
+        self.images.remove(idx);
+        if idx < self.current {
+            self.current -= 1;
+        }
+        if self.images.is_empty() {
+            self.current = 0;
+        } else if self.current >= self.images.len() {
+            self.current = self.images.len() - 1;
+        }
+        if was_current {
+            self.queue_preload();
+            self.prioritize_thumbs();
+        }
+        self.filter_msg = Some((format!("Removed: {}", file_label(path)), 1.5));
+    }
+
     fn drain_results(&mut self, ctx: &egui::Context) {
+        let cur_gen = self.current_generation.load(Ordering::Relaxed);
         while let Ok(res) = self.result_rx.try_recv() {
+            // Drop anything that was decoded for a previous folder open. The
+            // PathBuf coming back may collide with a same-named file in the
+            // current folder, so without this guard a stale decode would
+            // silently overwrite the new folder's cache and the wrong pixels
+            // would flash on screen.
+            let job_gen = match &res {
+                JobResult::Full(g, ..) => *g,
+                JobResult::Thumb(g, ..) => *g,
+            };
+            if job_gen != cur_gen {
+                continue;
+            }
             match res {
-                JobResult::Full(path, result, exif_q) => {
+                JobResult::Full(_, path, result, exif_q) => {
                     self.exif_quarter.insert(path.clone(), exif_q);
-                    let mut cache = self.cache.lock().unwrap();
+                    let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                     cache.insert(path.clone(), result.clone());
                     drop(cache);
                     if let LoadedImage::Ready(ci) = result {
@@ -466,9 +841,9 @@ impl SnapView {
                         }
                     }
                 }
-                JobResult::Thumb(path, result, dims, exif_q) => {
+                JobResult::Thumb(_, path, result, dims, exif_q) => {
                     self.exif_quarter.entry(path.clone()).or_insert(exif_q);
-                    let mut tc = self.thumb_cache.lock().unwrap();
+                    let mut tc = self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner());
                     tc.insert(path.clone(), result.clone());
                     drop(tc);
                     if let Some(d) = dims { self.full_dims.insert(path.clone(), d); }
@@ -506,7 +881,7 @@ impl SnapView {
 
     fn ensure_texture(&mut self, ctx: &egui::Context, path: &Path) {
         if self.textures.contains_key(path) { return; }
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(LoadedImage::Ready(ci)) = cache.get(path) {
             let ci = ci.clone();
             drop(cache);
@@ -547,6 +922,7 @@ impl SnapView {
         if self.images.is_empty() { return; }
         let n = self.images.len();
         if self.visible_count() == 0 { return; }
+        self.nav_direction = if forward { 1 } else { -1 };
         let mut idx = self.current;
         for _ in 0..n {
             idx = if forward {
@@ -619,12 +995,10 @@ impl SnapView {
         }
         let was_fav = self.favorites.remove(&path);
         if was_fav {
-            if let Some(folder) = &self.folder {
-                save_favorites(folder, &self.favorites);
-            }
+            self.persist_favorites();
         }
-        self.cache.lock().unwrap().remove(&path);
-        self.thumb_cache.lock().unwrap().remove(&path);
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
+        self.thumb_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
         self.textures.remove(&path);
         self.thumb_textures.remove(&path);
         self.rotation.remove(&path);
@@ -632,7 +1006,14 @@ impl SnapView {
         self.full_dims.remove(&path);
         self.sidecars.remove(&path);
         self.images.remove(idx);
-        if idx <= self.current && self.current > 0 {
+        // Index fixup after removing `idx`:
+        //   idx <  current  -> shift current down by one (same image stays selected)
+        //   idx == current  -> leave current alone; the slot now holds what was
+        //                      next (so the viewer advances forward, matching
+        //                      most viewers' "delete then go to the following
+        //                      image" behavior). Clamped below.
+        //   idx >  current  -> nothing to do.
+        if idx < self.current {
             self.current -= 1;
         }
 
@@ -679,8 +1060,16 @@ impl SnapView {
         };
         if self.favorites.contains(&p) { self.favorites.remove(&p); }
         else { self.favorites.insert(p); }
-        if let Some(folder) = &self.folder {
-            save_favorites(folder, &self.favorites);
+        self.persist_favorites();
+    }
+
+    /// Save favorites to disk, surfacing any I/O error as a transient toast
+    /// instead of silently dropping it (read-only volumes, full disk, locked
+    /// file on Windows, …).
+    fn persist_favorites(&mut self) {
+        let Some(folder) = self.folder.clone() else { return };
+        if let Err(e) = save_favorites(&folder, &self.favorites) {
+            self.filter_msg = Some((format!("Couldn't save favorites: {}", e), 3.0));
         }
     }
 
@@ -707,15 +1096,20 @@ impl SnapView {
             self.target_pan = egui::Vec2::ZERO;
         }
         // First zoom past ~1.05 on the current image promotes it to a native
-        // re-decode in the background, so the pixels stay crisp at any zoom
-        // factor. Once promoted, it stays HQ for this session (we don't
-        // downgrade on zoom out — re-decoding is the expensive part).
+        // re-decode in the background. Promotions are kept as a bounded FIFO
+        // (most recent at the back) so that long browsing sessions don't
+        // accumulate dozens of native-resolution textures.
         if self.target_zoom > 1.05 {
             if let Some(p) = self.current_path() {
-                let mut set = self.zoom_hq_paths.lock().unwrap();
-                if set.insert(p.clone()) {
+                const ZOOM_HQ_MAX: usize = 20;
+                let mut set = self.zoom_hq_paths.lock().unwrap_or_else(|e| e.into_inner());
+                if !set.iter().any(|x| x == &p) {
+                    if set.len() >= ZOOM_HQ_MAX {
+                        set.pop_front();
+                    }
+                    set.push_back(p.clone());
                     drop(set);
-                    self.cache.lock().unwrap().remove(&p);
+                    self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(&p);
                     self.textures.remove(&p);
                     self.full_q.prioritize(&[p]);
                 }
@@ -747,6 +1141,12 @@ impl SnapView {
     fn maybe_resize_window_to_image(&mut self, ctx: &egui::Context) {
         let path = match self.current_path() { Some(p) => p, None => return };
         if self.last_resized_path.as_ref() == Some(&path) { return; }
+        // Only resize once the new image actually has something to render —
+        // otherwise the OS resizes the window before the new content lands
+        // and the user sees the desktop behind for a frame or two.
+        let new_ready = self.textures.contains_key(&path)
+            || self.thumb_textures.contains_key(&path);
+        if !new_ready { return; }
         let (iw, ih) = match self.display_dims(&path) { Some(d) => d, None => return };
         if iw == 0 || ih == 0 { return; }
         let aspect = iw as f32 / ih as f32;
@@ -771,7 +1171,6 @@ impl SnapView {
         let new_y = outer.top();
 
         if (outer.width() - new_w).abs() < 2.0 {
-            // Nothing to resize; just remember the class.
             self.last_aspect_class = Some(class);
             self.last_resized_path = Some(path);
             return;
@@ -779,9 +1178,6 @@ impl SnapView {
 
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(new_w, new_h)));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(new_x, new_y)));
-        // Skip painting for a couple of frames so the OS resize doesn't
-        // stretch the old image into the new bounds (visible as a flash).
-        self.resize_paint_skip = 2;
 
         self.last_aspect_class = Some(class);
         self.last_resized_path = Some(path);
@@ -800,7 +1196,7 @@ impl SnapView {
     /// any cached info available — full cache, thumb full_dims, or the texture
     /// itself. EXIF and user rotation both factored in.
     fn display_dims(&self, path: &Path) -> Option<(usize, usize)> {
-        let raw = if let Some(LoadedImage::Ready(ci)) = self.cache.lock().unwrap().get(path) {
+        let raw = if let Some(LoadedImage::Ready(ci)) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
             Some((ci.size[0], ci.size[1]))
         } else if let Some(d) = self.full_dims.get(path) {
             Some((d[0], d[1]))
@@ -856,7 +1252,7 @@ impl SnapView {
         for p in &moved {
             self.favorites.remove(p);
             self.filter_selected.remove(p);
-            self.cache.lock().unwrap().remove(p);
+            self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(p);
             self.textures.remove(p);
             self.thumb_textures.remove(p);
             self.rotation.remove(p);
@@ -864,9 +1260,7 @@ impl SnapView {
             self.full_dims.remove(p);
         }
         self.images.retain(|p| !moved.contains(p));
-        if let Some(folder) = &self.folder {
-            save_favorites(folder, &self.favorites);
-        }
+        self.persist_favorites();
         if self.images.is_empty() {
             self.current = 0;
         } else {
@@ -891,13 +1285,26 @@ impl SnapView {
     }
 }
 
+impl Drop for SnapView {
+    fn drop(&mut self) {
+        // Wake the decoder threads so they can exit their blocking pop()
+        // loop. The threads detach naturally with the process, but closing
+        // explicitly avoids the zombie-on-restart case and quiets shutdown
+        // diagnostics from sanitizers.
+        self.full_q.close();
+        self.thumb_q.close();
+    }
+}
+
 impl eframe::App for SnapView {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_theme(ctx);
         self.drain_results(ctx);
+        self.drain_fs_events();
 
         // Reset view when current image changes
         let cur_path = self.current_path();
@@ -937,12 +1344,17 @@ impl eframe::App for SnapView {
                 }
                 if i.key_pressed(egui::Key::Delete) { self.actions.delete = true; }
                 if i.key_pressed(egui::Key::Escape) {
-                    if self.is_fullscreen { self.actions.toggle_max = true; }
+                    if self.show_help { self.show_help = false; }
+                    else if self.is_fullscreen { self.actions.toggle_max = true; }
                     else { self.actions.quit = true; }
                 }
                 if i.key_pressed(egui::Key::O) && i.modifiers.ctrl { self.actions.open_folder = true; }
                 if i.key_pressed(egui::Key::F11) { self.actions.toggle_max = true; }
                 if i.key_pressed(egui::Key::Enter) && i.modifiers.alt { self.actions.toggle_max = true; }
+                if i.key_pressed(egui::Key::F1) { self.actions.toggle_help = true; }
+                if i.key_pressed(egui::Key::I) { self.actions.toggle_metadata = true; }
+                if i.key_pressed(egui::Key::E) && i.modifiers.ctrl { self.actions.show_in_explorer = true; }
+                if i.key_pressed(egui::Key::C) && i.modifiers.ctrl { self.actions.copy_to_clipboard = true; }
             }
         });
 
@@ -969,35 +1381,17 @@ impl eframe::App for SnapView {
             self.maybe_resize_window_to_image(ctx);
         }
         // During an OS resize the previous frame's content gets stretched into
-        // the new bounds, producing a visible flash. For a couple of frames
-        // after we send the resize command we paint nothing — the desktop /
-        // app behind shows through transparently instead.
-        let resizing = self.resize_paint_skip > 0;
-        if resizing {
-            self.resize_paint_skip -= 1;
-        }
-        let bg_alpha: u8 = if resizing {
-            0
-        } else if focused && !suppress_dim {
-            235
-        } else {
-            0
-        };
+        let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
-            if !resizing {
-                self.render_image(ui, ctx);
-                self.render_overlay(ui);
-                self.handle_background_interaction(ui, ctx);
-                self.render_close_button(ui);
-                self.render_nav_chevrons(ui);
-                self.handle_touch_swipe(ui);
-            } else {
-                // Keep continuous repaint requests flowing so we exit the
-                // skip-frames state promptly.
-                ctx.request_repaint();
-            }
+            self.render_image(ui, ctx);
+            self.render_overlay(ui);
+            self.render_metadata_overlay(ui);
+            self.handle_background_interaction(ui, ctx);
+            self.render_close_button(ui);
+            self.render_nav_chevrons(ui);
+            self.handle_touch_swipe(ui);
         });
 
         if self.show_filter {
@@ -1008,8 +1402,12 @@ impl eframe::App for SnapView {
             self.render_delete_confirm(ctx);
         }
 
-        if self.show_about {
-            self.render_about(ctx);
+        if self.show_prefs {
+            self.render_prefs(ctx);
+        }
+
+        if self.show_help {
+            self.render_help(ctx);
         }
 
         // Apply queued actions
@@ -1031,6 +1429,16 @@ impl eframe::App for SnapView {
                 self.open_folder(&d, None);
             }
         }
+        if let Some(d) = actions.open_recent {
+            if d.is_dir() {
+                self.open_folder(&d, None);
+            } else {
+                // Folder is gone — drop it from recents and surface why.
+                self.prefs.recent.retain(|p| p != &d);
+                let _ = save_preferences(&self.prefs);
+                self.filter_msg = Some((format!("Folder no longer exists: {}", d.display()), 2.5));
+            }
+        }
         if actions.toggle_max {
             self.is_fullscreen = !self.is_fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
@@ -1042,15 +1450,19 @@ impl eframe::App for SnapView {
         if actions.delete { self.request_delete(); }
         if actions.confirm_delete { self.confirm_delete(); }
         if actions.cancel_delete { self.pending_delete = None; }
-        if actions.show_about { self.show_about = true; }
+        if actions.show_prefs { self.show_prefs = true; }
+        if actions.toggle_help { self.show_help = !self.show_help; }
+        if actions.toggle_metadata { self.show_metadata = !self.show_metadata; }
+        if actions.show_in_explorer { self.show_current_in_file_manager(); }
+        if actions.copy_to_clipboard { self.copy_current_to_clipboard(); }
         if actions.request_hq {
-            // Global HQ mode toggle: when on, all subsequent decodes target
-            // native resolution. Existing cached/uploaded textures are
-            // discarded so the active image gets re-decoded at the new tier.
+            // Global HQ mode toggle. We keep the existing low-res textures on
+            // the GPU so the screen stays full while HQ decodes land in the
+            // background; the CPU-side ColorImage cache *is* cleared so that
+            // ensure_texture / re-uploads can't pull a stale low-res copy.
             let new_mode = !self.hq_mode.load(Ordering::Relaxed);
             self.hq_mode.store(new_mode, Ordering::Relaxed);
-            self.cache.lock().unwrap().clear();
-            self.textures.clear();
+            self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
             self.full_q.clear();
             self.queue_preload();
             self.filter_msg = Some((
@@ -1072,18 +1484,72 @@ impl eframe::App for SnapView {
 }
 
 impl SnapView {
+    /// Empty-state view: title, a "Choose folder…" primary button, hint about
+    /// Ctrl+O / drag-drop, and a recent-folders list when we have any saved.
+    fn render_empty_state(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_rect_before_wrap();
+        let card_w = 460.0_f32.min(avail.width() - 40.0);
+        let card_x = avail.center().x - card_w * 0.5;
+        let card_y = (avail.center().y - 180.0).max(avail.top() + 20.0);
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(
+                    egui::pos2(card_x, card_y),
+                    egui::vec2(card_w, avail.bottom() - card_y - 20.0),
+                ))
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+        child.add_space(10.0);
+        child.label(egui::RichText::new("snapview").size(28.0).strong());
+        child.label(
+            egui::RichText::new("Drop a folder or image · Ctrl+O to choose")
+                .color(egui::Color32::from_gray(140))
+                .size(13.0),
+        );
+        child.add_space(18.0);
+        if child
+            .add_sized([220.0, 32.0], egui::Button::new("Choose folder…"))
+            .clicked()
+        {
+            self.actions.open_folder = true;
+        }
+        child.add_space(18.0);
+
+        if !self.prefs.recent.is_empty() {
+            child.separator();
+            child.add_space(6.0);
+            child.label(
+                egui::RichText::new("Recent")
+                    .color(egui::Color32::from_gray(160))
+                    .size(12.0),
+            );
+            child.add_space(4.0);
+            let recents = self.prefs.recent.clone();
+            for p in &recents {
+                let label = recent_label(p);
+                let resp = child.add(
+                    egui::Button::new(
+                        egui::RichText::new(label)
+                            .size(13.0)
+                            .color(egui::Color32::from_gray(220)),
+                    )
+                    .frame(false)
+                    .min_size(egui::vec2(card_w - 20.0, 22.0)),
+                );
+                if resp.clicked() {
+                    self.actions.open_recent = Some(p.clone());
+                }
+                resp.on_hover_text(p.display().to_string());
+            }
+        }
+    }
+
     fn render_image(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let avail = ui.available_size();
         let path = match self.current_path() {
             Some(p) => p,
             None => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new("Drop a folder or image here\nor press Ctrl+O")
-                            .color(egui::Color32::from_gray(140))
-                            .size(20.0),
-                    );
-                });
+                self.render_empty_state(ui);
                 self.handle_drop(ctx);
                 return;
             }
@@ -1091,18 +1557,53 @@ impl SnapView {
 
         self.ensure_texture(ctx, &path);
 
-        let user_quarter = *self.rotation.get(&path).unwrap_or(&0);
-        let exif_q = *self.exif_quarter.get(&path).unwrap_or(&0);
+        // Choose what to actually paint. Preference order:
+        //   1. new path has a full texture                -> paint new (full).
+        //   2. previously displayed path has a full       -> keep painting prev,
+        //      so we never downgrade from a sharp image to a blurry thumb
+        //      while the user waits for the next full / HQ decode.
+        //   3. new path has a thumb (EXIF preview)        -> paint new (thumb).
+        //   4. previously displayed path has anything     -> paint prev.
+        //   5. fall through to the "..." placeholder.
+        let new_has_full = self.textures.contains_key(&path);
+        let new_has_thumb = self.thumb_textures.contains_key(&path);
+        let prev_has_full = self
+            .displayed_path
+            .as_ref()
+            .map(|p| self.textures.contains_key(p))
+            .unwrap_or(false);
+        let prev_has_anything = self
+            .displayed_path
+            .as_ref()
+            .map(|p| self.textures.contains_key(p) || self.thumb_textures.contains_key(p))
+            .unwrap_or(false);
+
+        let draw_path: PathBuf = if new_has_full {
+            self.displayed_path = Some(path.clone());
+            path.clone()
+        } else if prev_has_full {
+            self.displayed_path.clone().unwrap()
+        } else if new_has_thumb {
+            self.displayed_path = Some(path.clone());
+            path.clone()
+        } else if prev_has_anything {
+            self.displayed_path.clone().unwrap()
+        } else {
+            path.clone()
+        };
+
+        let user_quarter = *self.rotation.get(&draw_path).unwrap_or(&0);
+        let exif_q = *self.exif_quarter.get(&draw_path).unwrap_or(&0);
         let rotation_quarter = (user_quarter + exif_q).rem_euclid(4);
 
-        let full_tex = self.textures.get(&path).cloned();
-        let tex_opt = full_tex.clone().or_else(|| self.thumb_textures.get(&path).cloned());
+        let full_tex = self.textures.get(&draw_path).cloned();
+        let tex_opt = full_tex.clone().or_else(|| self.thumb_textures.get(&draw_path).cloned());
 
         if let Some(tex) = tex_opt {
             // Prefer full texture's own size; otherwise use stored full dims; finally fall back to texture size.
             let img_size = if let Some(t) = &full_tex {
                 t.size_vec2()
-            } else if let Some(d) = self.full_dims.get(&path) {
+            } else if let Some(d) = self.full_dims.get(&draw_path) {
                 egui::vec2(d[0] as f32, d[1] as f32)
             } else {
                 tex.size_vec2()
@@ -1121,11 +1622,24 @@ impl SnapView {
             let angle = rotation_quarter as f32 * std::f32::consts::FRAC_PI_2;
 
             let mut mesh = egui::Mesh::with_texture(tex.id());
-            mesh.add_rect_with_uv(
-                egui::Rect::from_center_size(egui::Pos2::ZERO, egui::vec2(draw_w, draw_h)),
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+            let local_rect =
+                egui::Rect::from_center_size(egui::Pos2::ZERO, egui::vec2(draw_w, draw_h));
+            let uv_rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            // macOS-style continuous-ish corner rounding when windowed. In
+            // fullscreen the image bleeds to the display edges (no panel
+            // around it to round against).
+            let corner_radius = if self.is_fullscreen { 0.0 } else { 12.0 };
+            if corner_radius > 0.5 {
+                add_rounded_rect_with_uv(
+                    &mut mesh,
+                    local_rect,
+                    uv_rect,
+                    corner_radius,
+                    egui::Color32::WHITE,
+                );
+            } else {
+                mesh.add_rect_with_uv(local_rect, uv_rect, egui::Color32::WHITE);
+            }
             mesh.rotate(egui::emath::Rot2::from_angle(angle), egui::Pos2::ZERO);
             mesh.translate(center.to_vec2());
             ui.painter().add(egui::Shape::mesh(mesh));
@@ -1138,7 +1652,7 @@ impl SnapView {
             // No texture yet, but keep last_image_rect in sync with the
             // image's known aspect so overlays/chevrons sit in the right
             // place during the brief decode window.
-            if let Some((w, h)) = self.display_dims(&path) {
+            if let Some((w, h)) = self.display_dims(&draw_path) {
                 let fit_w = w as f32;
                 let fit_h = h as f32;
                 let base_scale = (avail.x / fit_w).min(avail.y / fit_h).min(1.0).max(0.01);
@@ -1226,6 +1740,69 @@ impl SnapView {
                 msg,
                 egui::FontId::proportional(16.0),
                 egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha),
+            );
+        }
+    }
+
+    fn render_metadata_overlay(&mut self, ui: &mut egui::Ui) {
+        if !self.show_metadata { return; }
+        let path = match self.current_path() { Some(p) => p, None => return };
+        // Decode-on-demand cache. The EXIF read is fast (kamadak parses just
+        // the header) so doing it on the UI thread is fine — but we still
+        // cache to avoid repeating it every frame while the HUD is up.
+        if !self.metadata_cache.contains_key(&path) {
+            let md = read_image_metadata(&path);
+            self.metadata_cache.insert(path.clone(), if md.is_empty() { None } else { Some(md) });
+        }
+        let md = match self.metadata_cache.get(&path).cloned().flatten() {
+            Some(m) => m,
+            None => return,
+        };
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(s) = &md.date_taken { lines.push(s.clone()); }
+        if let Some(s) = &md.camera { lines.push(s.clone()); }
+        if let Some(s) = &md.lens { lines.push(s.clone()); }
+        let exposure: Vec<&str> = [&md.shutter, &md.aperture, &md.iso, &md.focal]
+            .iter()
+            .filter_map(|o| o.as_deref())
+            .collect();
+        if !exposure.is_empty() { lines.push(exposure.join("   ·   ")); }
+        let dims_size: Vec<&str> = [&md.dimensions, &md.file_size]
+            .iter()
+            .filter_map(|o| o.as_deref())
+            .collect();
+        if !dims_size.is_empty() { lines.push(dims_size.join("   ·   ")); }
+        if lines.is_empty() { return; }
+
+        let rect = if self.is_fullscreen {
+            ui.available_rect_before_wrap()
+        } else {
+            self.last_image_rect.unwrap_or_else(|| ui.available_rect_before_wrap())
+        };
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(13.0);
+        let pad = 12.0;
+        let line_h = 18.0;
+        let max_w = lines
+            .iter()
+            .map(|l| painter.layout_no_wrap(l.clone(), font.clone(), egui::Color32::WHITE).rect.width())
+            .fold(0.0_f32, f32::max);
+        let box_w = max_w + pad * 2.0;
+        let box_h = lines.len() as f32 * line_h + pad * 2.0;
+        let origin = egui::pos2(rect.left() + 14.0, rect.top() + 14.0);
+        let box_rect = egui::Rect::from_min_size(origin, egui::vec2(box_w, box_h));
+        painter.rect_filled(
+            box_rect,
+            8.0,
+            egui::Color32::from_rgba_premultiplied(0, 0, 0, 170),
+        );
+        for (i, line) in lines.iter().enumerate() {
+            painter.text(
+                egui::pos2(origin.x + pad, origin.y + pad + i as f32 * line_h),
+                egui::Align2::LEFT_TOP,
+                line,
+                font.clone(),
+                egui::Color32::from_rgba_premultiplied(240, 240, 240, 230),
             );
         }
     }
@@ -1390,10 +1967,25 @@ impl SnapView {
         let fav_total = self.favorites.len();
         let filter_label = self.filter_mode.label();
 
+        let recents = self.prefs.recent.clone();
         resp.context_menu(|ui| {
             if ui.button("Open folder…  (Ctrl+O)").clicked() {
                 self.actions.open_folder = true;
                 ui.close_menu();
+            }
+            if !recents.is_empty() {
+                ui.menu_button("Recent folders", |ui| {
+                    for p in &recents {
+                        if ui
+                            .button(recent_label(p))
+                            .on_hover_text(p.display().to_string())
+                            .clicked()
+                        {
+                            self.actions.open_recent = Some(p.clone());
+                            ui.close_menu();
+                        }
+                    }
+                });
             }
             ui.separator();
             if ui.button("Rotate left  (Q)").clicked() { self.actions.rot_left = true; ui.close_menu(); }
@@ -1412,6 +2004,9 @@ impl SnapView {
             ui.separator();
             if ui.button("Move to trash  (Delete)").clicked() { self.actions.delete = true; ui.close_menu(); }
             ui.separator();
+            if ui.button("Copy image to clipboard  (Ctrl+C)").clicked() { self.actions.copy_to_clipboard = true; ui.close_menu(); }
+            if ui.button("Show in file manager  (Ctrl+E)").clicked() { self.actions.show_in_explorer = true; ui.close_menu(); }
+            ui.separator();
             if ui.button("Toggle fullscreen  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
             ui.separator();
             let hq_label = if self.hq_mode.load(Ordering::Relaxed) {
@@ -1421,7 +2016,10 @@ impl SnapView {
             };
             if ui.button(hq_label).clicked() { self.actions.request_hq = true; ui.close_menu(); }
             ui.separator();
-            if ui.button("About snapview…").clicked() { self.actions.show_about = true; ui.close_menu(); }
+            let info_label = if self.show_metadata { "Hide image info  (I)" } else { "Show image info  (I)" };
+            if ui.button(info_label).clicked() { self.actions.toggle_metadata = true; ui.close_menu(); }
+            if ui.button("Keyboard shortcuts  (F1)").clicked() { self.actions.toggle_help = true; ui.close_menu(); }
+            if ui.button("Preferences…").clicked() { self.actions.show_prefs = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
         });
     }
@@ -1503,9 +2101,127 @@ impl SnapView {
         if do_cancel { self.actions.cancel_delete = true; }
     }
 
-    fn render_about(&mut self, ctx: &egui::Context) {
+    fn render_help(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
-        egui::Area::new(egui::Id::new("about_dim"))
+        egui::Area::new(egui::Id::new("help_dim"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    egui::Color32::from_rgba_premultiplied(0, 0, 0, 180),
+                );
+                if ui.allocate_rect(screen, egui::Sense::click()).clicked() {
+                    self.show_help = false;
+                }
+            });
+
+        let pairs_left: &[(&str, &str)] = &[
+            ("Next image", "→  /  scroll down"),
+            ("Previous image", "←  /  scroll up"),
+            ("Zoom in / out", "Ctrl + scroll"),
+            ("Reset zoom", "Num 0"),
+            ("HQ mode (native)", "Z"),
+            ("Show / hide image info", "I"),
+            ("Open folder…", "Ctrl + O"),
+            ("Copy image to clipboard", "Ctrl + C"),
+            ("Show in file manager", "Ctrl + E"),
+        ];
+        let pairs_right: &[(&str, &str)] = &[
+            ("Mark / unmark favorite", "Space"),
+            ("Cycle filter (all / favs / non-favs)", "F"),
+            ("Filter favorites window…", "Shift + F"),
+            ("Move to trash", "Delete"),
+            ("Rotate left / right", "Q  /  W"),
+            ("Toggle fullscreen", "F11  /  Alt + Enter"),
+            ("Show / hide this help", "F1"),
+            ("Quit (or exit fullscreen first)", "Esc"),
+        ];
+
+        egui::Window::new("Keyboard shortcuts")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                ui.set_min_width(560.0);
+                ui.add_space(4.0);
+                egui::Grid::new("help_grid")
+                    .num_columns(4)
+                    .spacing([24.0, 6.0])
+                    .show(ui, |ui| {
+                        let rows = pairs_left.len().max(pairs_right.len());
+                        for i in 0..rows {
+                            if let Some((desc, key)) = pairs_left.get(i) {
+                                ui.label(egui::RichText::new(*desc).color(egui::Color32::from_gray(220)));
+                                ui.label(egui::RichText::new(*key).strong().color(egui::Color32::from_rgb(180, 200, 255)));
+                            } else {
+                                ui.label("");
+                                ui.label("");
+                            }
+                            if let Some((desc, key)) = pairs_right.get(i) {
+                                ui.label(egui::RichText::new(*desc).color(egui::Color32::from_gray(220)));
+                                ui.label(egui::RichText::new(*key).strong().color(egui::Color32::from_rgb(180, 200, 255)));
+                            } else {
+                                ui.label("");
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Mouse:").strong());
+                    ui.label("drag = move window (or pan when zoomed) · double-click = fullscreen · right-click = menu");
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Touch:").strong());
+                    ui.label("swipe horizontally to flick between images");
+                });
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("Press F1 or Esc to dismiss")
+                        .color(egui::Color32::from_gray(150)).italics());
+                });
+                ui.add_space(2.0);
+            });
+    }
+
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        let light = self.effective_light(ctx);
+        if self.applied_light != Some(light) {
+            ctx.set_visuals(if light {
+                egui::Visuals::light()
+            } else {
+                egui::Visuals::dark()
+            });
+            self.applied_light = Some(light);
+        }
+    }
+
+    fn effective_light(&self, ctx: &egui::Context) -> bool {
+        match self.prefs.theme {
+            ThemeMode::Light => true,
+            ThemeMode::Dark => false,
+            ThemeMode::Auto => {
+                // egui populates viewport.theme from the OS (winit reads the
+                // Windows AppsUseLightTheme registry / NSAppearance / etc.).
+                // Default to dark when the system doesn't expose a preference.
+                match ctx.system_theme() {
+                    Some(egui::Theme::Light) => true,
+                    Some(egui::Theme::Dark) => false,
+                    None => false,
+                }
+            }
+        }
+    }
+
+    fn render_prefs(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("prefs_dim"))
             .fixed_pos(screen.min)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -1518,30 +2234,58 @@ impl SnapView {
             });
 
         let mut close = false;
-        egui::Window::new("About snapview")
+        let mut theme_changed: Option<ThemeMode> = None;
+        egui::Window::new("Preferences")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
-                ui.set_min_width(320.0);
+                ui.set_min_width(360.0);
                 ui.add_space(6.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("snapview").size(22.0).strong());
-                    ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .color(egui::Color32::from_gray(180)));
-                    ui.add_space(10.0);
-                    ui.label("Fast, minimal image viewer");
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("by Filip Kozina")
-                        .color(egui::Color32::from_gray(200)));
-                    ui.add_space(14.0);
-                    if ui.button("Close").clicked() { close = true; }
-                });
+                ui.label(egui::RichText::new("Appearance").strong());
                 ui.add_space(4.0);
+                let mut t = self.prefs.theme;
+                ui.horizontal(|ui| {
+                    if ui.radio_value(&mut t, ThemeMode::Auto, "Follow system").clicked() {}
+                    if ui.radio_value(&mut t, ThemeMode::Light, "Light").clicked() {}
+                    if ui.radio_value(&mut t, ThemeMode::Dark, "Dark").clicked() {}
+                });
+                if t != self.prefs.theme {
+                    theme_changed = Some(t);
+                }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("snapview").size(20.0).strong());
+                    ui.label(
+                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.add_space(6.0);
+                    ui.label("Fast, minimal image viewer");
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("by Filip Kozina")
+                            .color(egui::Color32::from_gray(180)),
+                    );
+                    ui.add_space(14.0);
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+                ui.add_space(2.0);
             });
+
+        if let Some(t) = theme_changed {
+            self.prefs.theme = t;
+            let _ = save_preferences(&self.prefs);
+        }
         if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.show_about = false;
+            self.show_prefs = false;
         }
     }
 
@@ -1674,11 +2418,83 @@ fn draw_chevron(painter: &egui::Painter, rect: egui::Rect, hovered: bool, points
     painter.line_segment([bot, tip], stroke);
 }
 
+fn file_label(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// Compact one-line label for a recent-folder entry: the last two path
+/// segments ("Photos / 2024-08") so similarly-named folders are
+/// distinguishable without showing the whole absolute path.
+fn recent_label(p: &Path) -> String {
+    let segs: Vec<String> = p
+        .components()
+        .rev()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .take(2)
+        .collect();
+    if segs.is_empty() {
+        p.display().to_string()
+    } else if segs.len() == 1 {
+        segs.into_iter().next().unwrap()
+    } else {
+        let mut it = segs.into_iter();
+        let last = it.next().unwrap();
+        let parent = it.next().unwrap();
+        format!("{} / {}", parent, last)
+    }
+}
+
 fn is_image(p: &Path) -> bool {
-    p.extension()
-        .and_then(|s| s.to_str())
-        .map(|s| SUPPORTED_EXTS.iter().any(|e| e.eq_ignore_ascii_case(s)))
-        .unwrap_or(false)
+    if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+        return SUPPORTED_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext));
+    }
+    // Some cameras (and renames) drop the extension entirely. Peek a few
+    // bytes and accept files whose header matches one of our supported
+    // formats. Files with any extension (even an unknown one) are NOT
+    // sniffed — that keeps folder-scan I/O bounded and avoids false
+    // positives on .txt/.json that happen to start with binary noise.
+    has_supported_magic(p)
+}
+
+fn has_supported_magic(p: &Path) -> bool {
+    use std::io::Read;
+    let f = match std::fs::File::open(p) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut head = [0u8; 12];
+    let n = std::io::BufReader::new(f).read(&mut head).unwrap_or(0);
+    if n < 4 {
+        return false;
+    }
+    // JPEG: FF D8 FF
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return true;
+    }
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if head.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        return true;
+    }
+    // GIF: GIF87a / GIF89a
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return true;
+    }
+    // BMP: BM
+    if head.starts_with(b"BM") {
+        return true;
+    }
+    // WebP: RIFF....WEBP
+    if n >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return true;
+    }
+    // TIFF: II*\0 (LE) or MM\0* (BE)
+    if head.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || head.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+        return true;
+    }
+    false
 }
 
 fn is_raw_sidecar(p: &Path) -> bool {
@@ -1708,9 +2524,15 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<(image::Dynami
     let icc = decoder.icc_profile();
     let w = info.width as u32;
     let h = info.height as u32;
+    // Guard against gigapixel JPEGs that would overflow u32 byte counts
+    // (anything past ~32_767 px on either axis). Done with usize arithmetic
+    // and checked_mul so the multiplication can't silently wrap.
+    let byte_count = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|wh| wh.checked_mul(4))?;
     let rgba: Vec<u8> = match info.pixel_format {
         jpeg_decoder::PixelFormat::RGB24 => {
-            let mut out = vec![0u8; (w * h * 4) as usize];
+            let mut out = vec![0u8; byte_count];
             for (i, c) in pixels.chunks_exact(3).enumerate() {
                 let o = i * 4;
                 out[o] = c[0];
@@ -1721,7 +2543,7 @@ fn decode_jpeg_scaled(path: &Path, target_max_dim: u32) -> Option<(image::Dynami
             out
         }
         jpeg_decoder::PixelFormat::L8 => {
-            let mut out = vec![0u8; (w * h * 4) as usize];
+            let mut out = vec![0u8; byte_count];
             for (i, &v) in pixels.iter().enumerate() {
                 let o = i * 4;
                 out[o] = v;
@@ -1884,37 +2706,92 @@ fn decode_jpeg_exif_thumb(path: &Path) -> Option<(LoadedImage, Option<[usize; 2]
 /// Minimal EXIF scanner: extracts (thumb_bytes?, full_width, full_height,
 /// orientation). Reads at most a few KB of header before seeking directly
 /// to the thumbnail bytes; doesn't depend on a full EXIF parser.
+/// Minimal EXIF + JPEG SOF scanner: extracts (thumb_bytes?, image_width,
+/// image_height, orientation). The width/height come from the JPEG's SOFn
+/// frame header (always present) rather than EXIF IFD0's ImageWidth/Length
+/// tags, which many encoders simply omit.
 fn read_jpeg_exif_metadata(path: &Path) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
     let mut soi = [0u8; 2];
     f.read_exact(&mut soi).ok()?;
     if soi != [0xFF, 0xD8] { return None; }
-    for _ in 0..32 {
-        let mut marker = [0u8; 2];
-        f.read_exact(&mut marker).ok()?;
-        if marker[0] != 0xFF { return None; }
-        if matches!(marker[1], 0xD9 | 0xDA) { return None; }
+
+    let mut exif: Option<(Option<Vec<u8>>, u32, u32, u32)> = None;
+    let mut sof: Option<(u32, u32)> = None;
+
+    for _ in 0..64 {
+        // A marker is 0xFF followed by a non-zero / non-0xFF byte; encoders
+        // may emit any number of 0xFF fill bytes between segments. Walk past
+        // them and any stray non-marker bytes (corruption resilience).
+        let mut b = [0u8; 1];
+        if f.read_exact(&mut b).is_err() { break; }
+        if b[0] != 0xFF { continue; }
+        let m = loop {
+            let mut x = [0u8; 1];
+            if f.read_exact(&mut x).is_err() { return finalize(exif, sof); }
+            if x[0] != 0xFF { break x[0]; }
+        };
+        // SOI/EOI/RSTn/TEM are standalone (no length, no payload).
+        if m == 0x00 || m == 0xD8 || m == 0xD9 || m == 0x01 || (0xD0..=0xD7).contains(&m) {
+            if m == 0xD9 { break; } // EOI
+            continue;
+        }
+        // SOS (Start of Scan): compressed entropy data follows; we'd have to
+        // scan for the next non-stuffed 0xFFxx marker. Anything we care about
+        // appears before SOS, so just stop.
+        if m == 0xDA { break; }
         let mut len_bytes = [0u8; 2];
-        f.read_exact(&mut len_bytes).ok()?;
+        if f.read_exact(&mut len_bytes).is_err() { break; }
         let seg_len = u16::from_be_bytes(len_bytes) as u64;
+        // A valid length is >= 2 (it includes the two length bytes themselves).
+        if seg_len < 2 { break; }
+        let payload_len = seg_len - 2;
         let seg_data_start = f.stream_position().ok()?;
-        if marker[1] == 0xE1 {
+        let seg_end = seg_data_start + payload_len;
+
+        // SOFn family (frame header). Excludes DHT (C4), JPG (C8), DAC (CC).
+        if (0xC0..=0xCF).contains(&m) && m != 0xC4 && m != 0xC8 && m != 0xCC {
+            let mut frame = [0u8; 5];
+            if payload_len >= 5 && f.read_exact(&mut frame).is_ok() {
+                let h = u16::from_be_bytes([frame[1], frame[2]]) as u32;
+                let w = u16::from_be_bytes([frame[3], frame[4]]) as u32;
+                sof = Some((w, h));
+            }
+            f.seek(SeekFrom::Start(seg_end)).ok()?;
+        } else if m == 0xE1 && exif.is_none() {
             let mut id = [0u8; 6];
-            if f.read_exact(&mut id).is_err() {
-                f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+            if payload_len < 6 || f.read_exact(&mut id).is_err() {
+                f.seek(SeekFrom::Start(seg_end)).ok()?;
                 continue;
             }
             if &id == b"Exif\0\0" {
-                return parse_tiff_for_metadata(&mut f);
+                exif = parse_tiff_for_metadata(&mut f);
+                let _ = f.seek(SeekFrom::Start(seg_end));
             } else {
-                f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+                f.seek(SeekFrom::Start(seg_end)).ok()?;
             }
         } else {
-            f.seek(SeekFrom::Start(seg_data_start + seg_len - 2)).ok()?;
+            f.seek(SeekFrom::Start(seg_end)).ok()?;
         }
+        if exif.is_some() && sof.is_some() { break; }
     }
-    None
+
+    finalize(exif, sof)
+}
+
+fn finalize(
+    exif: Option<(Option<Vec<u8>>, u32, u32, u32)>,
+    sof: Option<(u32, u32)>,
+) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
+    let (thumb, ew, eh, orient) = exif.unwrap_or((None, 0, 0, 1));
+    let (w, h) = match (sof, (ew != 0 && eh != 0).then_some((ew, eh))) {
+        (Some(s), _) => s,
+        (None, Some(e)) => e,
+        _ => (0, 0),
+    };
+    if w == 0 && h == 0 && thumb.is_none() { return None; }
+    Some((thumb, w, h, orient))
 }
 
 fn parse_tiff_for_metadata(f: &mut std::fs::File) -> Option<(Option<Vec<u8>>, u32, u32, u32)> {
@@ -1978,6 +2855,148 @@ fn parse_tiff_for_metadata(f: &mut std::fs::File) -> Option<(Option<Vec<u8>>, u3
     Some((bytes, img_w, img_h, orient))
 }
 
+#[derive(Clone, Default)]
+struct ImageMetadata {
+    date_taken: Option<String>,
+    camera: Option<String>,
+    lens: Option<String>,
+    shutter: Option<String>,
+    aperture: Option<String>,
+    iso: Option<String>,
+    focal: Option<String>,
+    dimensions: Option<String>,
+    file_size: Option<String>,
+}
+
+impl ImageMetadata {
+    fn is_empty(&self) -> bool {
+        self.date_taken.is_none()
+            && self.camera.is_none()
+            && self.lens.is_none()
+            && self.shutter.is_none()
+            && self.aperture.is_none()
+            && self.iso.is_none()
+            && self.focal.is_none()
+            && self.dimensions.is_none()
+            && self.file_size.is_none()
+    }
+}
+
+fn read_image_metadata(path: &Path) -> ImageMetadata {
+    let mut m = ImageMetadata::default();
+    if let Ok(meta) = std::fs::metadata(path) {
+        m.file_size = Some(format_file_size(meta.len()));
+    }
+    if let Ok(f) = std::fs::File::open(path) {
+        let mut reader = std::io::BufReader::new(f);
+        if let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) {
+            use exif::{In, Tag};
+            let get_str = |tag: Tag| -> Option<String> {
+                exif.get_field(tag, In::PRIMARY).and_then(|f| {
+                    let s = f.display_value().to_string();
+                    let s = s.trim().trim_matches('"').to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                })
+            };
+            let get_rational = |tag: Tag| -> Option<(u32, u32)> {
+                let f = exif.get_field(tag, In::PRIMARY)?;
+                if let exif::Value::Rational(ref v) = f.value {
+                    v.first().map(|r| (r.num as u32, r.denom as u32))
+                } else {
+                    None
+                }
+            };
+            // Date taken — prefer DateTimeOriginal, fall back to DateTime.
+            m.date_taken = get_str(Tag::DateTimeOriginal)
+                .or_else(|| get_str(Tag::DateTime))
+                .map(prettify_exif_datetime);
+            // Camera body — "Make Model" if both, else either.
+            let make = get_str(Tag::Make);
+            let model = get_str(Tag::Model);
+            m.camera = match (make, model) {
+                (Some(mk), Some(md)) if md.starts_with(&mk) => Some(md),
+                (Some(mk), Some(md)) => Some(format!("{} {}", mk, md)),
+                (Some(mk), None) => Some(mk),
+                (None, Some(md)) => Some(md),
+                _ => None,
+            };
+            m.lens = get_str(Tag::LensModel);
+            // Shutter speed (ExposureTime) as a fraction "1/x" when num=1.
+            if let Some((n, d)) = get_rational(Tag::ExposureTime) {
+                if d != 0 {
+                    m.shutter = Some(if n == 1 {
+                        format!("1/{} s", d)
+                    } else if n > 0 && (n as f64) / (d as f64) < 1.0 {
+                        format!("1/{} s", (d as f64 / n as f64).round() as u64)
+                    } else {
+                        format!("{:.1} s", n as f64 / d as f64)
+                    });
+                }
+            }
+            if let Some((n, d)) = get_rational(Tag::FNumber) {
+                if d != 0 {
+                    m.aperture = Some(format!("f/{:.1}", n as f64 / d as f64));
+                }
+            }
+            if let Some(iso) = get_str(Tag::PhotographicSensitivity).or_else(|| get_str(Tag::ISOSpeed)) {
+                m.iso = Some(format!("ISO {}", iso));
+            }
+            if let Some((n, d)) = get_rational(Tag::FocalLength) {
+                if d != 0 {
+                    m.focal = Some(format!("{} mm", (n as f64 / d as f64).round() as u64));
+                }
+            }
+            // Pixel dimensions from EXIF if present.
+            let pw = exif
+                .get_field(Tag::PixelXDimension, In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0));
+            let ph = exif
+                .get_field(Tag::PixelYDimension, In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0));
+            if let (Some(w), Some(h)) = (pw, ph) {
+                m.dimensions = Some(format!("{} × {}", w, h));
+            }
+        }
+    }
+    // Fallback dimensions from JPEG SOF when EXIF didn't carry them.
+    if m.dimensions.is_none() {
+        if let Some((_, w, h, _)) = read_jpeg_exif_metadata(path) {
+            if w > 0 && h > 0 {
+                m.dimensions = Some(format!("{} × {}", w, h));
+            }
+        }
+    }
+    m
+}
+
+fn prettify_exif_datetime(s: String) -> String {
+    // EXIF uses "YYYY:MM:DD HH:MM:SS". Replace the date colons with dashes
+    // so it reads more naturally; leave the time portion alone.
+    let bytes = s.as_bytes();
+    if bytes.len() >= 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {
+        format!(
+            "{}-{}-{} {}",
+            &s[0..4],
+            &s[5..7],
+            &s[8..10],
+            &s[11..]
+        )
+    } else {
+        s
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB { format!("{:.2} GB", b / GB) }
+    else if b >= MB { format!("{:.1} MB", b / MB) }
+    else if b >= KB { format!("{:.0} KB", b / KB) }
+    else { format!("{} B", bytes) }
+}
+
 fn read_exif_orientation(path: &Path) -> Option<u32> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
@@ -2024,21 +3043,88 @@ fn full_texture_options() -> egui::TextureOptions {
     }
 }
 
+/// Builds a textured rounded rect into an existing Mesh. Per-vertex UV is
+/// interpolated linearly from the position inside `rect`, so the caller can
+/// freely rotate/translate the resulting Mesh and the texture sticks with
+/// the geometry (rounded corners rotate together with the image content).
+fn add_rounded_rect_with_uv(
+    mesh: &mut egui::Mesh,
+    rect: egui::Rect,
+    uv: egui::Rect,
+    radius: f32,
+    color: egui::Color32,
+) {
+    let r = radius.clamp(0.0, rect.width().min(rect.height()) * 0.5);
+    if r < 0.5 {
+        mesh.add_rect_with_uv(rect, uv, color);
+        return;
+    }
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let segments: usize = 10;
+    // Corner arcs walked clockwise: top-left, top-right, bottom-right, bottom-left.
+    // Angles use egui's coord system (y grows downward).
+    let corners = [
+        (egui::pos2(rect.min.x + r, rect.min.y + r), PI, 1.5 * PI),
+        (egui::pos2(rect.max.x - r, rect.min.y + r), 1.5 * PI, 2.0 * PI),
+        (egui::pos2(rect.max.x - r, rect.max.y - r), 0.0, FRAC_PI_2),
+        (egui::pos2(rect.min.x + r, rect.max.y - r), FRAC_PI_2, PI),
+    ];
+    let center = rect.center();
+    let center_uv = egui::pos2(uv.min.x + uv.width() * 0.5, uv.min.y + uv.height() * 0.5);
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: center,
+        uv: center_uv,
+        color,
+    });
+    let mut perim_count: u32 = 0;
+    for &(c, a0, a1) in &corners {
+        for i in 0..=segments {
+            let t = i as f32 / segments as f32;
+            let a = a0 + (a1 - a0) * t;
+            let p = egui::pos2(c.x + r * a.cos(), c.y + r * a.sin());
+            let u = uv.min.x + (p.x - rect.min.x) / rect.width() * uv.width();
+            let v = uv.min.y + (p.y - rect.min.y) / rect.height() * uv.height();
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: p,
+                uv: egui::pos2(u, v),
+                color,
+            });
+            perim_count += 1;
+        }
+    }
+    for i in 0..perim_count {
+        let next = (i + 1) % perim_count;
+        mesh.indices.push(base);
+        mesh.indices.push(base + 1 + i);
+        mesh.indices.push(base + 1 + next);
+    }
+}
+
 fn color_image_from_rgba(size: [usize; 2], rgba: Vec<u8>) -> egui::ColorImage {
     debug_assert_eq!(size[0] * size[1] * 4, rgba.len());
     let pixel_count = rgba.len() / 4;
-    let mut pixels: Vec<egui::Color32> = Vec::with_capacity(pixel_count);
-    // Safety: Color32 is `#[repr(C)] struct(u8, u8, u8, u8)`, layout-identical
-    // to a packed RGBA tuple. We memcpy from the u8 buffer; avoids the per-pixel
-    // branch in ColorImage::from_rgba_unmultiplied (which is the bottleneck for
-    // multi-megapixel images).
+    // Pre-fill with zeroed Color32 so capacity == len exactly (avoids the
+    // Vec::with_capacity-then-set_len trap where capacity may exceed the
+    // requested count and a future Vec::shrink_to_fit / drop relies on the
+    // allocator-reported capacity matching the typed length).
+    let mut pixels: Vec<egui::Color32> = vec![egui::Color32::TRANSPARENT; pixel_count];
+    // Safety: Color32 is `#[repr(C)] struct(u8, u8, u8, u8)` with alignment 1
+    // (alignment of u8) and size 4. The byte-level layout is therefore
+    // identical to a packed RGBA tuple, and rgba.len() == pixel_count * 4.
+    // We copy through *mut u8 so the source pointer's 1-byte alignment is
+    // sufficient on every platform regardless of any future Color32 layout
+    // tightening.
+    const _: () = {
+        assert!(std::mem::size_of::<egui::Color32>() == 4);
+        assert!(std::mem::align_of::<egui::Color32>() == 1);
+    };
     unsafe {
         std::ptr::copy_nonoverlapping(
-            rgba.as_ptr() as *const egui::Color32,
-            pixels.as_mut_ptr(),
-            pixel_count,
+            rgba.as_ptr(),
+            pixels.as_mut_ptr() as *mut u8,
+            rgba.len(),
         );
-        pixels.set_len(pixel_count);
     }
     egui::ColorImage { size, pixels }
 }
@@ -2052,6 +3138,95 @@ fn load_app_icon() -> Option<egui::IconData> {
         width: w,
         height: h,
     })
+}
+
+/// Returns the directory for our per-user persistent state (preferences,
+/// future caches). Honors Windows %LOCALAPPDATA%, macOS Application Support,
+/// and the XDG base-dir spec on Linux. Returns None when none of those env
+/// vars are populated (extremely rare).
+fn config_dir() -> Option<PathBuf> {
+    let mut p = if cfg!(target_os = "windows") {
+        PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+    } else if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME")?;
+        let mut p = PathBuf::from(home);
+        p.push("Library");
+        p.push("Application Support");
+        p
+    } else {
+        match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(d) => PathBuf::from(d),
+            None => {
+                let home = std::env::var_os("HOME")?;
+                let mut p = PathBuf::from(home);
+                p.push(".config");
+                p
+            }
+        }
+    };
+    p.push("snapview");
+    Some(p)
+}
+
+fn preferences_path() -> Option<PathBuf> {
+    let mut p = config_dir()?;
+    p.push("preferences.txt");
+    Some(p)
+}
+
+fn load_preferences() -> Option<Preferences> {
+    let path = preferences_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut prefs = Preferences::default();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "theme" => {
+                    if let Some(t) = ThemeMode::parse(v) {
+                        prefs.theme = t;
+                    }
+                }
+                "recent" => {
+                    let p = PathBuf::from(v);
+                    if !p.as_os_str().is_empty() && prefs.recent.iter().all(|x| x != &p) {
+                        prefs.recent.push(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(prefs)
+}
+
+fn save_preferences(prefs: &Preferences) -> std::io::Result<()> {
+    let path = preferences_path().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no config dir")
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut content = format!("# snapview preferences\ntheme={}\n", prefs.theme.as_str());
+    for p in &prefs.recent {
+        content.push_str(&format!("recent={}\n", p.display()));
+    }
+    let mut tmp = path.clone();
+    let name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) => format!("{}.tmp", n),
+        None => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name")),
+    };
+    tmp.set_file_name(name);
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn favorites_path(folder: &Path) -> PathBuf {
@@ -2079,7 +3254,7 @@ fn load_favorites(folder: &Path, available: &[PathBuf]) -> HashSet<PathBuf> {
     set
 }
 
-fn save_favorites(folder: &Path, favs: &HashSet<PathBuf>) {
+fn save_favorites(folder: &Path, favs: &HashSet<PathBuf>) -> std::io::Result<()> {
     let path = favorites_path(folder);
     let mut names: Vec<String> = favs
         .iter()
@@ -2090,7 +3265,31 @@ fn save_favorites(folder: &Path, favs: &HashSet<PathBuf>) {
         "# snapview favorites — one filename per line\n{}\n",
         names.join("\n")
     );
-    let _ = std::fs::write(&path, content);
+    // Atomic write: stage to a sibling .tmp first, then rename onto the
+    // real path. fs::rename is atomic on the same volume on every OS we
+    // target, so a crash mid-write can never leave .favorites.txt as a
+    // truncated empty file (which would silently wipe the user's
+    // favorites the next time we read it).
+    let mut tmp = path.clone();
+    let new_name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) => format!("{}.tmp", n),
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "favorites path has no file name",
+            ));
+        }
+    };
+    tmp.set_file_name(new_name);
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn num_workers() -> usize {
