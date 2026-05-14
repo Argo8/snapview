@@ -93,9 +93,45 @@ struct PendingActions {
     delete: bool,
     confirm_delete: bool,
     cancel_delete: bool,
-    show_about: bool,
+    show_prefs: bool,
     request_hq: bool,
     toggle_help: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeMode {
+    Auto,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ThemeMode::Auto => "auto",
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "auto" => Some(ThemeMode::Auto),
+            "light" => Some(ThemeMode::Light),
+            "dark" => Some(ThemeMode::Dark),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Preferences {
+    theme: ThemeMode,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self { theme: ThemeMode::Auto }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -153,9 +189,12 @@ struct SnapView {
     result_rx: mpsc::Receiver<JobResult>,
 
     show_filter: bool,
-    show_about: bool,
+    show_prefs: bool,
     show_help: bool,
     filter_selected: HashSet<PathBuf>,
+
+    prefs: Preferences,
+    applied_light: Option<bool>,
 
     is_fullscreen: bool,
     last_resized_path: Option<PathBuf>,
@@ -335,9 +374,12 @@ impl SnapView {
             zoom_hq_paths,
             result_rx,
             show_filter: false,
-            show_about: false,
+            show_prefs: false,
             show_help: false,
             filter_selected: HashSet::new(),
+
+            prefs: load_preferences().unwrap_or_default(),
+            applied_light: None,
             is_fullscreen: false,
             last_resized_path: None,
             last_aspect_class: None,
@@ -1016,6 +1058,7 @@ impl eframe::App for SnapView {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_theme(ctx);
         self.drain_results(ctx);
 
         // Reset view when current image changes
@@ -1110,8 +1153,8 @@ impl eframe::App for SnapView {
             self.render_delete_confirm(ctx);
         }
 
-        if self.show_about {
-            self.render_about(ctx);
+        if self.show_prefs {
+            self.render_prefs(ctx);
         }
 
         if self.show_help {
@@ -1148,7 +1191,7 @@ impl eframe::App for SnapView {
         if actions.delete { self.request_delete(); }
         if actions.confirm_delete { self.confirm_delete(); }
         if actions.cancel_delete { self.pending_delete = None; }
-        if actions.show_about { self.show_about = true; }
+        if actions.show_prefs { self.show_prefs = true; }
         if actions.toggle_help { self.show_help = !self.show_help; }
         if actions.request_hq {
             // Global HQ mode toggle. We keep the existing low-res textures on
@@ -1577,7 +1620,7 @@ impl SnapView {
             if ui.button(hq_label).clicked() { self.actions.request_hq = true; ui.close_menu(); }
             ui.separator();
             if ui.button("Keyboard shortcuts  (F1)").clicked() { self.actions.toggle_help = true; ui.close_menu(); }
-            if ui.button("About snapview…").clicked() { self.actions.show_about = true; ui.close_menu(); }
+            if ui.button("Preferences…").clicked() { self.actions.show_prefs = true; ui.close_menu(); }
             if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
         });
     }
@@ -1745,9 +1788,38 @@ impl SnapView {
             });
     }
 
-    fn render_about(&mut self, ctx: &egui::Context) {
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        let light = self.effective_light(ctx);
+        if self.applied_light != Some(light) {
+            ctx.set_visuals(if light {
+                egui::Visuals::light()
+            } else {
+                egui::Visuals::dark()
+            });
+            self.applied_light = Some(light);
+        }
+    }
+
+    fn effective_light(&self, ctx: &egui::Context) -> bool {
+        match self.prefs.theme {
+            ThemeMode::Light => true,
+            ThemeMode::Dark => false,
+            ThemeMode::Auto => {
+                // egui populates viewport.theme from the OS (winit reads the
+                // Windows AppsUseLightTheme registry / NSAppearance / etc.).
+                // Default to dark when the system doesn't expose a preference.
+                match ctx.system_theme() {
+                    Some(egui::Theme::Light) => true,
+                    Some(egui::Theme::Dark) => false,
+                    None => false,
+                }
+            }
+        }
+    }
+
+    fn render_prefs(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
-        egui::Area::new(egui::Id::new("about_dim"))
+        egui::Area::new(egui::Id::new("prefs_dim"))
             .fixed_pos(screen.min)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -1760,30 +1832,58 @@ impl SnapView {
             });
 
         let mut close = false;
-        egui::Window::new("About snapview")
+        let mut theme_changed: Option<ThemeMode> = None;
+        egui::Window::new("Preferences")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
-                ui.set_min_width(320.0);
+                ui.set_min_width(360.0);
                 ui.add_space(6.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("snapview").size(22.0).strong());
-                    ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .color(egui::Color32::from_gray(180)));
-                    ui.add_space(10.0);
-                    ui.label("Fast, minimal image viewer");
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("by Filip Kozina")
-                        .color(egui::Color32::from_gray(200)));
-                    ui.add_space(14.0);
-                    if ui.button("Close").clicked() { close = true; }
-                });
+                ui.label(egui::RichText::new("Appearance").strong());
                 ui.add_space(4.0);
+                let mut t = self.prefs.theme;
+                ui.horizontal(|ui| {
+                    if ui.radio_value(&mut t, ThemeMode::Auto, "Follow system").clicked() {}
+                    if ui.radio_value(&mut t, ThemeMode::Light, "Light").clicked() {}
+                    if ui.radio_value(&mut t, ThemeMode::Dark, "Dark").clicked() {}
+                });
+                if t != self.prefs.theme {
+                    theme_changed = Some(t);
+                }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("snapview").size(20.0).strong());
+                    ui.label(
+                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.add_space(6.0);
+                    ui.label("Fast, minimal image viewer");
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("by Filip Kozina")
+                            .color(egui::Color32::from_gray(180)),
+                    );
+                    ui.add_space(14.0);
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+                ui.add_space(2.0);
             });
+
+        if let Some(t) = theme_changed {
+            self.prefs.theme = t;
+            let _ = save_preferences(&self.prefs);
+        }
         if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.show_about = false;
+            self.show_prefs = false;
         }
     }
 
@@ -2465,6 +2565,89 @@ fn load_app_icon() -> Option<egui::IconData> {
         width: w,
         height: h,
     })
+}
+
+/// Returns the directory for our per-user persistent state (preferences,
+/// future caches). Honors Windows %LOCALAPPDATA%, macOS Application Support,
+/// and the XDG base-dir spec on Linux. Returns None when none of those env
+/// vars are populated (extremely rare).
+fn config_dir() -> Option<PathBuf> {
+    let mut p = if cfg!(target_os = "windows") {
+        PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+    } else if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME")?;
+        let mut p = PathBuf::from(home);
+        p.push("Library");
+        p.push("Application Support");
+        p
+    } else {
+        match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(d) => PathBuf::from(d),
+            None => {
+                let home = std::env::var_os("HOME")?;
+                let mut p = PathBuf::from(home);
+                p.push(".config");
+                p
+            }
+        }
+    };
+    p.push("snapview");
+    Some(p)
+}
+
+fn preferences_path() -> Option<PathBuf> {
+    let mut p = config_dir()?;
+    p.push("preferences.txt");
+    Some(p)
+}
+
+fn load_preferences() -> Option<Preferences> {
+    let path = preferences_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut prefs = Preferences::default();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "theme" => {
+                    if let Some(t) = ThemeMode::parse(v) {
+                        prefs.theme = t;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(prefs)
+}
+
+fn save_preferences(prefs: &Preferences) -> std::io::Result<()> {
+    let path = preferences_path().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no config dir")
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = format!(
+        "# snapview preferences\ntheme={}\n",
+        prefs.theme.as_str()
+    );
+    let mut tmp = path.clone();
+    let name = match path.file_name().and_then(|s| s.to_str()) {
+        Some(n) => format!("{}.tmp", n),
+        None => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name")),
+    };
+    tmp.set_file_name(name);
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn favorites_path(folder: &Path) -> PathBuf {
