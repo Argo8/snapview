@@ -7,7 +7,7 @@
 #define MyAppPublisher "Filip Kozina"
 #define MyAppExeName "snapview.exe"
 #define MyAppId "{{B7F4C3E0-5E18-4D2D-9A4B-1A2F1E8A9D11}"
-#define MyAppProgId "snapview.image"
+#define MyVendorKey "Software\Filip Kozina\snapview"
 
 [Setup]
 AppId={#MyAppId}
@@ -53,23 +53,19 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
-; ---------- Registry: Open with + Default Apps (always installed) ----------
-; See: https://learn.microsoft.com/windows/win32/shell/default-programs
+; ---------- Registry: Open With + Default Apps (always installed) ----------
+; Reference: https://learn.microsoft.com/windows/win32/shell/default-programs
 ;
-; 1. Application registration (HKLM\Software\Classes\Applications\snapview.exe)
-;    Makes snapview appear in the "Open with" submenu for supported types.
-; 2. ProgID (HKLM\Software\Classes\snapview.image)
-;    Allows snapview to be associated as the default handler.
-; 3. RegisteredApplications + Capabilities
-;    Makes snapview appear in Settings -> Apps -> Default apps.
-;
-; All three are unconditional now — opening images via right-click and the
-; ability to be set as the default photo viewer are core features, not
-; opt-in extras.
+; Windows 11's Default Apps UI is per-extension, so we register a *distinct*
+; ProgID for every supported type (snapview.jpg, snapview.png, ...) and map
+; each ProgID back to the same shell\open\command. Capabilities then maps
+; one extension to one ProgID. Doing this lets the user pick snapview as
+; default for .jpg without also forcing it on .tiff.
 
 [Registry]
-; --- Application registration ---
+; --- Application registration (HKLM\...\Applications\snapview.exe) ---
 Root: HKLM; Subkey: "Software\Classes\Applications\{#MyAppExeName}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\Applications\{#MyAppExeName}\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"
 Root: HKLM; Subkey: "Software\Classes\Applications\{#MyAppExeName}\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
 Root: HKLM; Subkey: "Software\Classes\Applications\{#MyAppExeName}\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
 Root: HKLM; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".jpg"; ValueData: ""
@@ -81,30 +77,66 @@ Root: HKLM; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedType
 Root: HKLM; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".tif"; ValueData: ""
 Root: HKLM; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".tiff"; ValueData: ""
 
-; --- "Open with" hint for each extension (OpenWithProgids) ---
-Root: HKLM; Subkey: "Software\Classes\.jpg\OpenWithProgids"; ValueType: string; ValueName: "{#MyAppProgId}"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKLM; Subkey: "Software\Classes\.jpeg\OpenWithProgids"; ValueType: string; ValueName: "{#MyAppProgId}"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKLM; Subkey: "Software\Classes\.png\OpenWithProgids"; ValueType: string; ValueName: "{#MyAppProgId}"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKLM; Subkey: "Software\Classes\.bmp\OpenWithProgids"; ValueType: string; ValueName: "{#MyAppProgId}"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKLM; Subkey: "Software\Classes\.gif\OpenWithProgids"; ValueType: string; ValueName: "{#MyAppProgId}"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKLM; Subkey: "Software\Classes\.webp\OpenWithProgids"; ValueType: string; ValueName: "{#MyAppProgId}"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKLM; Subkey: "Software\Classes\.tif\OpenWithProgids"; ValueType: string; ValueName: "{#MyAppProgId}"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKLM; Subkey: "Software\Classes\.tiff\OpenWithProgids"; ValueType: string; ValueName: "{#MyAppProgId}"; ValueData: ""; Flags: uninsdeletevalue
+; --- Per-extension ProgIDs ---
+; .jpg
+Root: HKLM; Subkey: "Software\Classes\snapview.jpg"; ValueType: string; ValueData: "JPEG image"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\snapview.jpg"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "JPEG image"
+Root: HKLM; Subkey: "Software\Classes\snapview.jpg\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\snapview.jpg\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\.jpg\OpenWithProgids"; ValueType: string; ValueName: "snapview.jpg"; ValueData: ""; Flags: uninsdeletevalue
+; .jpeg
+Root: HKLM; Subkey: "Software\Classes\snapview.jpeg"; ValueType: string; ValueData: "JPEG image"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\snapview.jpeg"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "JPEG image"
+Root: HKLM; Subkey: "Software\Classes\snapview.jpeg\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\snapview.jpeg\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\.jpeg\OpenWithProgids"; ValueType: string; ValueName: "snapview.jpeg"; ValueData: ""; Flags: uninsdeletevalue
+; .png
+Root: HKLM; Subkey: "Software\Classes\snapview.png"; ValueType: string; ValueData: "PNG image"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\snapview.png"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "PNG image"
+Root: HKLM; Subkey: "Software\Classes\snapview.png\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\snapview.png\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\.png\OpenWithProgids"; ValueType: string; ValueName: "snapview.png"; ValueData: ""; Flags: uninsdeletevalue
+; .bmp
+Root: HKLM; Subkey: "Software\Classes\snapview.bmp"; ValueType: string; ValueData: "Bitmap image"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\snapview.bmp"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "Bitmap image"
+Root: HKLM; Subkey: "Software\Classes\snapview.bmp\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\snapview.bmp\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\.bmp\OpenWithProgids"; ValueType: string; ValueName: "snapview.bmp"; ValueData: ""; Flags: uninsdeletevalue
+; .gif
+Root: HKLM; Subkey: "Software\Classes\snapview.gif"; ValueType: string; ValueData: "GIF image"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\snapview.gif"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "GIF image"
+Root: HKLM; Subkey: "Software\Classes\snapview.gif\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\snapview.gif\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\.gif\OpenWithProgids"; ValueType: string; ValueName: "snapview.gif"; ValueData: ""; Flags: uninsdeletevalue
+; .webp
+Root: HKLM; Subkey: "Software\Classes\snapview.webp"; ValueType: string; ValueData: "WebP image"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\snapview.webp"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "WebP image"
+Root: HKLM; Subkey: "Software\Classes\snapview.webp\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\snapview.webp\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\.webp\OpenWithProgids"; ValueType: string; ValueName: "snapview.webp"; ValueData: ""; Flags: uninsdeletevalue
+; .tif
+Root: HKLM; Subkey: "Software\Classes\snapview.tif"; ValueType: string; ValueData: "TIFF image"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\snapview.tif"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "TIFF image"
+Root: HKLM; Subkey: "Software\Classes\snapview.tif\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\snapview.tif\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\.tif\OpenWithProgids"; ValueType: string; ValueName: "snapview.tif"; ValueData: ""; Flags: uninsdeletevalue
+; .tiff
+Root: HKLM; Subkey: "Software\Classes\snapview.tiff"; ValueType: string; ValueData: "TIFF image"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\snapview.tiff"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "TIFF image"
+Root: HKLM; Subkey: "Software\Classes\snapview.tiff\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKLM; Subkey: "Software\Classes\snapview.tiff\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+Root: HKLM; Subkey: "Software\Classes\.tiff\OpenWithProgids"; ValueType: string; ValueName: "snapview.tiff"; ValueData: ""; Flags: uninsdeletevalue
 
-; --- ProgID for Default Apps ---
-Root: HKLM; Subkey: "Software\Classes\{#MyAppProgId}"; ValueType: string; ValueData: "snapview image"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "Software\Classes\{#MyAppProgId}\DefaultIcon"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"",0"
-Root: HKLM; Subkey: "Software\Classes\{#MyAppProgId}\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
-
-; --- Capabilities (Default Apps in Settings) ---
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#MyAppName}"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Fast, minimal image viewer"
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpg"; ValueData: "{#MyAppProgId}"
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpeg"; ValueData: "{#MyAppProgId}"
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".png"; ValueData: "{#MyAppProgId}"
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".bmp"; ValueData: "{#MyAppProgId}"
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".gif"; ValueData: "{#MyAppProgId}"
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".webp"; ValueData: "{#MyAppProgId}"
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tif"; ValueData: "{#MyAppProgId}"
-Root: HKLM; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tiff"; ValueData: "{#MyAppProgId}"
-Root: HKLM; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: "Software\{#MyAppName}\Capabilities"; Flags: uninsdeletevalue
+; --- Capabilities under the vendor key (Default Apps in Settings) ---
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#MyAppName}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Fast, minimal image viewer"
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpg"; ValueData: "snapview.jpg"
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpeg"; ValueData: "snapview.jpeg"
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".png"; ValueData: "snapview.png"
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".bmp"; ValueData: "snapview.bmp"
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".gif"; ValueData: "snapview.gif"
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".webp"; ValueData: "snapview.webp"
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tif"; ValueData: "snapview.tif"
+Root: HKLM; Subkey: "{#MyVendorKey}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tiff"; ValueData: "snapview.tiff"
+Root: HKLM; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: "{#MyVendorKey}\Capabilities"; Flags: uninsdeletevalue
