@@ -1,68 +1,16 @@
 # snapview
 
-Ultra-brzi photo viewer u Rustu. Frameless prozor, sve preko shortcuta.
+Brz, minimalan preglednik fotografija za Windows. Otvori folder pun slika, listaj strelicama, označi favorite, kopiraj odabrane u drugi folder — sve preko tipkovnice, bez nereda na ekranu.
 
 ---
 
-## Kako dobiti gotov `snapview.exe` preko GitHub Actions
+## Brzi početak
 
-Slijedi 6 kratkih koraka. Nakon toga, svaki put kad pushaš promjenu, novi exe se automatski builda u oblaku.
+1. Dvoklik na bilo koju sliku u Exploreru i odaberi **snapview** (ili postavi kao zadani preglednik — vidi dolje).
+2. Ili pokreni snapview i pritisni **Ctrl+O** za odabir foldera.
+3. Ili jednostavno prevuci (drag & drop) folder ili sliku u prozor.
 
-### 1. Napravi GitHub account (ako ga već nemaš)
-
-https://github.com/signup — besplatno, 30 sekundi.
-
-### 2. Napravi novi repository
-
-https://github.com/new
-- Name: `snapview` (ili kako god želiš)
-- Public ili Private — svejedno, GitHub Actions je besplatan i za privatne repoe (do 2000 min/mj)
-- **Ne** dodavaj README, .gitignore ni LICENSE — već su u zipu
-- Klikni **Create repository**
-
-### 3. Uploadaj fajlove
-
-Najlakše bez instalacije gita: na novoj prazno-repo stranici klikni **"uploading an existing file"** link, pa drag-and-drop **sve** iz zipa (uključujući `.github` folder — pazi da nije skriven!).
-
-Ako Windows Explorer skriva `.github` folder:
-- View → Show → kvačica na "Hidden items"
-- Ili u browseru klikni "choose your files" pa Ctrl+A izaberi sve
-
-Klikni **Commit changes** dolje.
-
-### 4. Pričekaj build (~5 min)
-
-Idi na karticu **Actions** u repou. Vidjet ćeš workflow "Build snapview.exe" kako se vrti. Kad bude zelena kvačica:
-
-### 5. Skini exe
-
-Klikni na završeni run → na dnu stranice vidjet ćeš **Artifacts** → **`snapview-windows`** → klikni za download. Dobit ćeš zip s `snapview.exe` unutra.
-
-### 6. Pokreni
-
-Raspakiraj, dvoklik na `snapview.exe`. Ako iskoči SmartScreen → "More info" → "Run anyway" (jer exe nije digitalno potpisan).
-
----
-
-## Bonus: automatski release s gotovim exe-om
-
-Kad si zadovoljan kodom, u repou:
-
-```
-Releases (desno gore) → Create a new release → Choose a tag → "v1.0.0" → Create new tag → Publish release
-```
-
-Workflow će automatski attach-ati `snapview.exe` na release i bit će dostupan kao public download link. Tagovi koji počinju s `v` (npr. `v1.0.0`, `v0.2.1`) triggeraju release.
-
----
-
-## Manualno triggeranje builda
-
-Actions kartica → "Build snapview.exe" → "Run workflow" gumb → biraš branch → Run.
-
----
-
-## Shortcuts u snapview-u
+## Tipkovni prečaci
 
 | Tipka | Akcija |
 |---|---|
@@ -70,29 +18,89 @@ Actions kartica → "Build snapview.exe" → "Run workflow" gumb → biraš bran
 | **←** ili scroll gore | Prethodna slika |
 | **Q** / **W** | Rotiraj lijevo / desno |
 | **Space** | Označi favorit (★) |
-| **F** | Filter favorita + kopiranje u drugi folder |
+| **F** | Otvori filter favorita i kopiranje |
+| **I** | Prikaži EXIF info (datum, kamera, objektiv, ekspozicija) |
 | **Ctrl+O** | Otvori folder |
-| **F11** ili dvoklik | Maximize |
-| **Esc** | Zatvori |
-| Desni klik | Cijeli meni s svime |
-| Drag prozora | Lijevi klik + povuci |
-| Drag&drop | Baci folder ili sliku u prozor |
+| **Ctrl+C** | Kopiraj sliku u clipboard |
+| **Ctrl+E** | Prikaži sliku u Exploreru |
+| **+** / **-** ili Ctrl+scroll | Zoom in / out |
+| **0** | Reset zoom-a |
+| **F11** ili dvoklik | Fullscreen |
+| **Delete** | Premjesti sliku u smeće |
+| **Esc** | Zatvori prozor (ili izađi iz fullscreena) |
+| **Desni klik** | Cijeli meni s opcijama |
+| Lijevi klik + povuci | Pomakni prozor |
 
 ## Workflow s favoritima
 
-1. Otvori folder pun slika (Ctrl+O ili drag&drop)
-2. Listaj strelicama, **Space** označava one koje želiš
-3. **F** otvara filter prozor s svim označenima
-4. Otkvači one koje na kraju ne želiš
-5. "Copy N selected to folder…" → bira destinaciju → gotovo
+1. Otvori folder pun slika.
+2. Listaj strelicama, pritisni **Space** za one koje ti se sviđaju.
+3. **F** otvara filter prozor s svim označenima.
+4. Otkvači one koje na kraju ne želiš.
+5. **Copy N selected to folder…** odabire destinaciju — gotovo.
 
-Favoriti se spremaju u `.favorites.txt` u tom folderu (plain text, lako za debug i preživi premještanje).
+Favoriti se spremaju u `.favorites.txt` u tom folderu (običan tekst, preživljava premještanje foldera).
 
 ## Podržani formati
 
 JPG, PNG, BMP, GIF, WebP, TIFF.
-HEIC i RAW nisu podržani (mogu se dodati ako trebaš).
 
-## Postavljanje kao default photo viewer
+HEIC i RAW formati trenutno nisu podržani.
 
-Desni klik na bilo koju .jpg → "Open with" → "Choose another app" → snapview.exe → kvačica "Always use this app".
+## Postaviti kao zadani preglednik
+
+Desni klik na bilo koju `.jpg` → **Open with** → **Choose another app** → **snapview** → kvačica **Always use this app**.
+
+Thumbnaili u Exploreru ostaju isti kao prije — snapview ne mijenja ikone slika.
+
+## Postavke i podaci
+
+snapview pamti tvoje postavke (tema, nedavno otvarani folderi) u:
+
+```
+%LOCALAPPDATA%\snapview\
+```
+
+Deinstalacija ne briše ovaj folder — ako ga želiš ukloniti, izbriši ga ručno.
+
+## Deinstalacija
+
+**Settings → Apps → Installed apps → snapview → Uninstall**, ili kroz Control Panel.
+
+---
+
+## Pravne informacije
+
+**snapview** — copyright © 2026 Filip Kozina. Sva prava pridržana.
+
+### Odricanje odgovornosti
+
+Ovaj program isporučuje se "kakav jest" (*as is*), bez ikakvog jamstva, izričitog ili podrazumijevanog, uključujući bez ograničenja jamstva utrživosti, prikladnosti za određenu svrhu i neprekršivosti prava trećih strana. Ni u kojem slučaju autor neće biti odgovoran za bilo kakvu štetu nastalu korištenjem ili nemogućnošću korištenja ovog programa, uključujući gubitak podataka, gubitak dobiti ili druge posljedične štete.
+
+Korisnik je odgovoran za sigurnosnu kopiju vlastitih datoteka. snapview može premjestiti datoteke u smeće (Delete) — ova operacija je reverzibilna kroz Recycle Bin, ali korisnik snosi rizik vlastitih akcija.
+
+### Third-party software
+
+snapview je napisan u Rustu i koristi sljedeće open-source biblioteke, čije licence ostaju na snazi:
+
+- [egui / eframe](https://github.com/emilk/egui) — MIT / Apache-2.0
+- [image](https://github.com/image-rs/image) — MIT / Apache-2.0
+- [rfd](https://github.com/PolyMeilex/rfd) — MIT
+- [rayon](https://github.com/rayon-rs/rayon) — MIT / Apache-2.0
+- [kamadak-exif](https://github.com/kamadak/exif-rs) — BSD-2-Clause
+- [jpeg-decoder](https://github.com/image-rs/jpeg-decoder) — MIT / Apache-2.0
+- [lcms2](https://github.com/kornelski/rust-lcms2) — MIT (wrapper) + [Little CMS](https://www.littlecms.com/) — MIT
+- [notify](https://github.com/notify-rs/notify) — CC0-1.0 / Artistic-2.0
+- [arboard](https://github.com/1Password/arboard) — MIT / Apache-2.0
+- [trash](https://github.com/Byron/trash-rs) — MIT
+- [walkdir](https://github.com/BurntSushi/walkdir) — MIT / Unlicense
+
+Pune licence i autorska prava izvornih biblioteka dostupni su u njihovim službenim repozitorijima.
+
+### Privatnost
+
+snapview ne šalje nikakve podatke na internet. Sve obrade slika i metapodataka odvijaju se isključivo lokalno na tvom računalu. Aplikacija ne sadrži nikakvu telemetriju, analitiku ni automatska ažuriranja.
+
+### Kontakt
+
+Pitanja, bugovi ili prijedlozi: <https://github.com/Argo8/snapview/issues>
