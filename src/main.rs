@@ -230,6 +230,10 @@ struct SnapView {
     is_fullscreen: bool,
     last_resized_path: Option<PathBuf>,
     last_aspect_class: Option<i8>,
+    // Frames left to keep the panel background opaque after an auto-resize.
+    // Without this, the window is transparent while the OS animates the
+    // resize, and the desktop briefly shows through the rounded corners.
+    resize_settle_frames: u8,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -418,6 +422,7 @@ impl SnapView {
             is_fullscreen: false,
             last_resized_path: None,
             last_aspect_class: None,
+            resize_settle_frames: 0,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
@@ -1178,18 +1183,13 @@ impl SnapView {
 
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(new_w, new_h)));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(new_x, new_y)));
+        // Keep the window opaque for a few frames so the user doesn't see the
+        // desktop through the rounded corners while the OS animates the resize.
+        self.resize_settle_frames = 12;
+        ctx.request_repaint();
 
         self.last_aspect_class = Some(class);
         self.last_resized_path = Some(path);
-    }
-
-    fn current_is_portrait(&self) -> bool {
-        let path = match self.current_path() { Some(p) => p, None => return false };
-        let (w, h) = match self.display_dims(&path) {
-            Some(d) => d,
-            None => return false,
-        };
-        h > w
     }
 
     /// Returns the on-screen (post-rotation) dimensions of the image, using
@@ -1375,13 +1375,23 @@ impl eframe::App for SnapView {
             }
         }
 
-        let portrait = self.current_is_portrait();
-        let suppress_dim = portrait && !self.is_fullscreen && self.target_zoom <= 1.001;
+        // Windowed view auto-fits the window to the image's aspect, so when
+        // the image fills the window at zoom 1 we can drop the panel fill and
+        // let the rounded image itself be the visible "rounded window" — same
+        // effect in both portrait and landscape.
+        let suppress_dim = !self.is_fullscreen && self.target_zoom <= 1.001;
         if !self.is_fullscreen {
             self.maybe_resize_window_to_image(ctx);
         }
-        // During an OS resize the previous frame's content gets stretched into
-        let bg_alpha: u8 = if focused && !suppress_dim { 235 } else { 0 };
+        // During an OS resize the window is transparent and the desktop shows
+        // through the rounded corners; hold the panel opaque for a few frames
+        // after an auto-resize to cover that window.
+        let settling = self.resize_settle_frames > 0;
+        if settling {
+            self.resize_settle_frames -= 1;
+            ctx.request_repaint();
+        }
+        let bg_alpha: u8 = if settling || (focused && !suppress_dim) { 235 } else { 0 };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
