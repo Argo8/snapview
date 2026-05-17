@@ -1378,8 +1378,15 @@ impl eframe::App for SnapView {
         // Windowed view auto-fits the window to the image's aspect, so when
         // the image fills the window at zoom 1 we can drop the panel fill and
         // let the rounded image itself be the visible "rounded window" — same
-        // effect in both portrait and landscape.
-        let suppress_dim = !self.is_fullscreen && self.target_zoom <= 1.001;
+        // effect in both portrait and landscape. Require an actual image to
+        // be loaded: with no current image (empty state) or before the
+        // texture is ready the panel is the only thing painting pixels, and
+        // a transparent fill leaves the window invisible and click-through.
+        let has_image = self
+            .current_path()
+            .and_then(|p| self.display_dims(&p))
+            .is_some();
+        let suppress_dim = has_image && !self.is_fullscreen && self.target_zoom <= 1.001;
         if !self.is_fullscreen {
             self.maybe_resize_window_to_image(ctx);
         }
