@@ -2,10 +2,18 @@
 ; Build: ISCC.exe installer\snapview.iss
 ;        ISCC.exe /DMyAppVersion=1.2.3 installer\snapview.iss   (CI override)
 ; Sign:  set SIGNTOOL to a signtool.exe command with cert/timestamp args before running ISCC.
+;
+; Versioning convention (semver-style):
+;   * Small update / bug fix  -> bump PATCH       (1.0.0 -> 1.0.1)
+;   * Bigger update / new feature -> bump MINOR   (1.0.5 -> 1.1.0)
+;   * Major release / breaking change -> bump MAJOR (1.9.0 -> 2.0.0)
+; Keep this in sync with Cargo.toml's `version = "..."`. CI overrides it
+; from the pushed git tag (v1.2.3 -> 1.2.3), so for tagged release builds
+; only the tag matters.
 
 #define MyAppName "snapview"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.0.1"
 #endif
 #define MyAppPublisher "Filip Kozina"
 #define MyAppExeName "snapview.exe"

@@ -234,9 +234,11 @@ struct SnapView {
     // Without this, the window is transparent while the OS animates the
     // resize, and the desktop briefly shows through the rounded corners.
     resize_settle_frames: u8,
-    // Whether we've already sized the window to the empty-state card.
-    // Reset whenever we leave empty state, so a fresh entry resizes again.
-    empty_state_sized: bool,
+    // Last size we requested for the empty-state card. We re-request a resize
+    // whenever the desired size changes (recent count grew, F1 help opened
+    // and the card needs to expand to fit the dialog, etc.). Cleared when we
+    // leave empty state so a fresh entry resizes again.
+    empty_state_size: Option<(f32, f32)>,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -426,7 +428,7 @@ impl SnapView {
             last_resized_path: None,
             last_aspect_class: None,
             resize_settle_frames: 0,
-            empty_state_sized: false,
+            empty_state_size: None,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
@@ -1142,6 +1144,80 @@ impl SnapView {
         true
     }
 
+    /// Frameless windows don't get OS-provided edge-drag-to-resize, so we run
+    /// our own hit-test on every frame: when the pointer is within a thin
+    /// band of any edge/corner of the window, swap the cursor to the matching
+    /// resize glyph and, on primary press, hand off to the OS via
+    /// `ViewportCommand::BeginResize`. Skipped in fullscreen.
+    fn handle_window_resize(&self, ctx: &egui::Context) {
+        if self.is_fullscreen { return; }
+        let rect = ctx.screen_rect();
+        let pos = match ctx.input(|i| i.pointer.hover_pos()) {
+            Some(p) => p,
+            None => return,
+        };
+        if !rect.contains(pos) { return; }
+
+        let edge = 8.0_f32;
+        let corner = 14.0_f32;
+        let on_left = pos.x - rect.left() < edge;
+        let on_right = rect.right() - pos.x < edge;
+        let on_top = pos.y - rect.top() < edge;
+        let on_bottom = rect.bottom() - pos.y < edge;
+        let near_left = pos.x - rect.left() < corner;
+        let near_right = rect.right() - pos.x < corner;
+        let near_top = pos.y - rect.top() < corner;
+        let near_bottom = rect.bottom() - pos.y < corner;
+
+        // Corners win over edges so a 14x14 box at each corner always picks
+        // the diagonal resize direction even if only one axis is within the
+        // edge band.
+        let direction = if (on_top && near_left) || (near_top && on_left) {
+            Some(egui::ResizeDirection::NorthWest)
+        } else if (on_top && near_right) || (near_top && on_right) {
+            Some(egui::ResizeDirection::NorthEast)
+        } else if (on_bottom && near_left) || (near_bottom && on_left) {
+            Some(egui::ResizeDirection::SouthWest)
+        } else if (on_bottom && near_right) || (near_bottom && on_right) {
+            Some(egui::ResizeDirection::SouthEast)
+        } else if on_top {
+            Some(egui::ResizeDirection::North)
+        } else if on_bottom {
+            Some(egui::ResizeDirection::South)
+        } else if on_left {
+            Some(egui::ResizeDirection::West)
+        } else if on_right {
+            Some(egui::ResizeDirection::East)
+        } else {
+            None
+        };
+
+        let dir = match direction {
+            Some(d) => d,
+            None => return,
+        };
+
+        let cursor = match dir {
+            egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => {
+                egui::CursorIcon::ResizeNwSe
+            }
+            egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => {
+                egui::CursorIcon::ResizeNeSw
+            }
+            egui::ResizeDirection::North | egui::ResizeDirection::South => {
+                egui::CursorIcon::ResizeVertical
+            }
+            egui::ResizeDirection::East | egui::ResizeDirection::West => {
+                egui::CursorIcon::ResizeHorizontal
+            }
+        };
+        ctx.set_cursor_icon(cursor);
+
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
+    }
+
     /// When windowed, only on a portrait ↔ landscape transition: rescale the
     /// window's width to the new image's aspect, leave height untouched, and
     /// reposition so the window stays centered around its previous middle.
@@ -1397,17 +1473,24 @@ impl eframe::App for SnapView {
         // window down to the card so there's no big dark frame around it.
         let suppress_dim = (has_image && !self.is_fullscreen && self.target_zoom <= 1.001)
             || (empty_state && !self.is_fullscreen);
-        if empty_state && !self.is_fullscreen && !self.empty_state_sized {
-            let (cw, ch) = empty_state_card_size(self.prefs.recent.len());
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(cw, ch)));
-            self.empty_state_sized = true;
-            // Cover the OS-side resize with an opaque panel for a few frames
-            // so the desktop doesn't flash through the rounded corners.
-            self.resize_settle_frames = 12;
-            ctx.request_repaint();
+        if empty_state && !self.is_fullscreen {
+            let want = empty_state_card_size(self.prefs.recent.len(), self.show_help);
+            let needs_resize = self
+                .empty_state_size
+                .map(|prev| (prev.0 - want.0).abs() > 1.0 || (prev.1 - want.1).abs() > 1.0)
+                .unwrap_or(true);
+            if needs_resize {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(want.0, want.1)));
+                self.empty_state_size = Some(want);
+                // Cover the OS-side resize with an opaque panel for a few
+                // frames so the desktop doesn't flash through the rounded
+                // corners.
+                self.resize_settle_frames = 12;
+                ctx.request_repaint();
+            }
         }
         if !empty_state {
-            self.empty_state_sized = false;
+            self.empty_state_size = None;
         }
         if !self.is_fullscreen {
             self.maybe_resize_window_to_image(ctx);
@@ -1420,6 +1503,11 @@ impl eframe::App for SnapView {
             self.resize_settle_frames -= 1;
             ctx.request_repaint();
         }
+        // Custom window border resize: must run before the empty-state /
+        // background interacts so it can claim the press when the cursor is
+        // on an edge or corner.
+        self.handle_window_resize(ctx);
+
         // Panel fill is transparent in steady state for both image and empty
         // modes (rounded image / card is the visible surface). Drop in an
         // opaque fill only during a resize settle window or when the user
@@ -1692,19 +1780,39 @@ impl SnapView {
             for p in recents.iter().take(recent_rows) {
                 let label = recent_label(p);
                 let full = p.display().to_string();
+                let row_h = 24.0_f32;
+                let row_rect = egui::Rect::from_min_size(
+                    egui::pos2(inner.left(), col.cursor().top()),
+                    egui::vec2(inner.width(), row_h),
+                );
+                // Peek hover state before laying out so we can paint a
+                // background underneath the button.
+                let pre_hovered = col.rect_contains_pointer(row_rect);
+                if pre_hovered {
+                    col.painter().rect_filled(
+                        row_rect.expand2(egui::vec2(4.0, 1.0)),
+                        6.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                    );
+                }
+                let text_color = if pre_hovered {
+                    egui::Color32::from_gray(245)
+                } else {
+                    egui::Color32::from_gray(220)
+                };
                 let row_resp = col.add(
                     egui::Button::new(
-                        egui::RichText::new(label)
-                            .size(13.0)
-                            .color(egui::Color32::from_gray(220)),
+                        egui::RichText::new(label).size(13.0).color(text_color),
                     )
                     .frame(false)
-                    .min_size(egui::vec2(inner.width(), 24.0)),
+                    .min_size(egui::vec2(inner.width(), row_h)),
                 );
                 if row_resp.clicked() {
                     self.actions.open_recent = Some(p.clone());
                 }
-                row_resp.on_hover_text(full);
+                row_resp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(full);
             }
         }
 
@@ -2619,7 +2727,7 @@ fn file_label(p: &Path) -> String {
 /// Window dimensions for the empty-state card. Sized just large enough to
 /// fit the header, drop zone, up-to-5 recent rows and the bottom hint strip
 /// — anything more and the user sees a tall empty rectangle.
-fn empty_state_card_size(recent_count: usize) -> (f32, f32) {
+fn empty_state_card_size(recent_count: usize, show_help: bool) -> (f32, f32) {
     let n = recent_count.min(5);
     let header = 4.0 + 26.0 + 1.0 + 16.0 + 16.0;
     let drop_zone = 96.0 + 18.0;
@@ -2627,7 +2735,15 @@ fn empty_state_card_size(recent_count: usize) -> (f32, f32) {
     let hint_strip = 24.0;
     let padding = 22.0 * 2.0;
     let h = header + drop_zone + recents + hint_strip + padding;
-    (440.0, h)
+    if show_help {
+        // The F1 help is a centered egui Window with min_width 560 plus its
+        // own padding, two columns of shortcuts and a few footer lines. The
+        // start-screen card is much smaller than that — expand the OS window
+        // so the help dialog isn't clipped.
+        (640.0_f32.max(440.0), 460.0_f32.max(h))
+    } else {
+        (440.0, h)
+    }
 }
 
 fn recent_label(p: &Path) -> String {
