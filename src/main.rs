@@ -234,6 +234,9 @@ struct SnapView {
     // Without this, the window is transparent while the OS animates the
     // resize, and the desktop briefly shows through the rounded corners.
     resize_settle_frames: u8,
+    // Whether we've already sized the window to the empty-state card.
+    // Reset whenever we leave empty state, so a fresh entry resizes again.
+    empty_state_sized: bool,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -423,6 +426,7 @@ impl SnapView {
             last_resized_path: None,
             last_aspect_class: None,
             resize_settle_frames: 0,
+            empty_state_sized: false,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             filter_msg: None,
@@ -1386,7 +1390,25 @@ impl eframe::App for SnapView {
             .current_path()
             .and_then(|p| self.display_dims(&p))
             .is_some();
-        let suppress_dim = has_image && !self.is_fullscreen && self.target_zoom <= 1.001;
+        let empty_state = !has_image;
+        // In empty state the rendered card IS the window — same trick as the
+        // rounded image in image mode. Drop the panel fill so the transparent
+        // window outside the rounded card lets the desktop show, and size the
+        // window down to the card so there's no big dark frame around it.
+        let suppress_dim = (has_image && !self.is_fullscreen && self.target_zoom <= 1.001)
+            || (empty_state && !self.is_fullscreen);
+        if empty_state && !self.is_fullscreen && !self.empty_state_sized {
+            let (cw, ch) = empty_state_card_size(self.prefs.recent.len());
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(cw, ch)));
+            self.empty_state_sized = true;
+            // Cover the OS-side resize with an opaque panel for a few frames
+            // so the desktop doesn't flash through the rounded corners.
+            self.resize_settle_frames = 12;
+            ctx.request_repaint();
+        }
+        if !empty_state {
+            self.empty_state_sized = false;
+        }
         if !self.is_fullscreen {
             self.maybe_resize_window_to_image(ctx);
         }
@@ -1398,17 +1420,30 @@ impl eframe::App for SnapView {
             self.resize_settle_frames -= 1;
             ctx.request_repaint();
         }
+        // Panel fill is transparent in steady state for both image and empty
+        // modes (rounded image / card is the visible surface). Drop in an
+        // opaque fill only during a resize settle window or when the user
+        // clicks away from a non-rounded view.
         let bg_alpha: u8 = if settling || (focused && !suppress_dim) { 235 } else { 0 };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
             self.render_image(ui, ctx);
-            self.render_overlay(ui);
-            self.render_metadata_overlay(ui);
-            self.handle_background_interaction(ui, ctx);
-            self.render_close_button(ui);
-            self.render_nav_chevrons(ui);
-            self.handle_touch_swipe(ui);
+            if !empty_state {
+                // In empty state the central area is filled with the
+                // start-screen card; a full-area background interact would
+                // sit on top of the buttons and swallow their clicks, and
+                // the window-drag-on-press is handled by the card's own
+                // empty zones.
+                self.render_overlay(ui);
+                self.render_metadata_overlay(ui);
+                self.handle_background_interaction(ui, ctx);
+                self.render_close_button(ui);
+                self.render_nav_chevrons(ui);
+                self.handle_touch_swipe(ui);
+            } else {
+                self.render_close_button(ui);
+            }
         });
 
         if self.show_filter {
@@ -1505,59 +1540,198 @@ impl SnapView {
     /// Ctrl+O / drag-drop, and a recent-folders list when we have any saved.
     fn render_empty_state(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_rect_before_wrap();
-        let card_w = 460.0_f32.min(avail.width() - 40.0);
-        let card_x = avail.center().x - card_w * 0.5;
-        let card_y = (avail.center().y - 180.0).max(avail.top() + 20.0);
-        let mut child = ui.new_child(
+        let ctx = ui.ctx().clone();
+
+        // The card IS the window. We paint a rounded rect covering the entire
+        // panel, against the (transparent) panel fill — so the window appears
+        // as just the rounded card on the desktop, with no dark frame around.
+        let surface = avail;
+        let painter = ui.painter();
+        painter.rect_filled(
+            surface,
+            14.0,
+            egui::Color32::from_rgba_unmultiplied(18, 18, 20, 245),
+        );
+        painter.rect_stroke(
+            surface,
+            14.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+            ),
+        );
+
+        // Window drag handle. Sits on the whole surface, behind the widgets:
+        // egui resolves overlapping interacts to the last-registered widget,
+        // so buttons added later still win their clicks.
+        let drag_resp = ui.interact(
+            surface,
+            egui::Id::new("empty_state_drag"),
+            egui::Sense::click_and_drag(),
+        );
+        if drag_resp.drag_started_by(egui::PointerButton::Primary) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if drag_resp.double_clicked() {
+            self.actions.toggle_max = true;
+        }
+
+        let inner = surface.shrink2(egui::vec2(26.0, 22.0));
+        let mut col = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_min_size(
-                    egui::pos2(card_x, card_y),
-                    egui::vec2(card_w, avail.bottom() - card_y - 20.0),
-                ))
+                .max_rect(inner)
                 .layout(egui::Layout::top_down(egui::Align::Center)),
         );
-        child.add_space(10.0);
-        child.label(egui::RichText::new("snapview").size(28.0).strong());
-        child.label(
-            egui::RichText::new("Drop a folder or image · Ctrl+O to choose")
-                .color(egui::Color32::from_gray(140))
-                .size(13.0),
+
+        // ── Header ─────────────────────────────────────────────────────
+        col.add_space(4.0);
+        col.label(
+            egui::RichText::new("snapview")
+                .size(26.0)
+                .strong()
+                .color(egui::Color32::from_gray(240)),
         );
-        child.add_space(18.0);
-        if child
-            .add_sized([220.0, 32.0], egui::Button::new("Choose folder…"))
-            .clicked()
+        col.add_space(1.0);
+        col.label(
+            egui::RichText::new("Fast, minimal photo viewer")
+                .size(12.0)
+                .color(egui::Color32::from_gray(135)),
+        );
+        col.add_space(16.0);
+
+        // ── Drop zone with primary action ──────────────────────────────
+        let drop_h = 96.0_f32;
+        let drop_rect = egui::Rect::from_min_size(
+            egui::pos2(inner.left(), col.cursor().top()),
+            egui::vec2(inner.width(), drop_h),
+        );
+        let drop_resp = col.interact(
+            drop_rect,
+            egui::Id::new("empty_drop_zone"),
+            egui::Sense::click(),
+        );
+        let hovered = drop_resp.hovered();
         {
+            let dp = col.painter();
+            dp.rect_filled(
+                drop_rect,
+                10.0,
+                if hovered {
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 6)
+                },
+            );
+            let border_col = if hovered {
+                egui::Color32::from_rgba_unmultiplied(120, 160, 230, 200)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50)
+            };
+            dp.rect_stroke(drop_rect, 10.0, egui::Stroke::new(1.0, border_col));
+            dp.text(
+                drop_rect.center() - egui::vec2(0.0, 22.0),
+                egui::Align2::CENTER_CENTER,
+                "Drop a folder or image",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_gray(215),
+            );
+        }
+
+        let btn_w = 190.0_f32;
+        let btn_h = 30.0_f32;
+        let btn_rect = egui::Rect::from_center_size(
+            drop_rect.center() + egui::vec2(0.0, 14.0),
+            egui::vec2(btn_w, btn_h),
+        );
+        let mut btn_ui = col.new_child(
+            egui::UiBuilder::new()
+                .max_rect(btn_rect)
+                .layout(egui::Layout::centered_and_justified(
+                    egui::Direction::TopDown,
+                )),
+        );
+        let btn_resp = btn_ui.add(
+            egui::Button::new(
+                egui::RichText::new("Choose folder")
+                    .size(13.0)
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(egui::Color32::from_rgb(48, 110, 215))
+            .rounding(7.0)
+            .min_size(egui::vec2(btn_w, btn_h)),
+        );
+        if btn_resp.clicked() || drop_resp.clicked() {
             self.actions.open_folder = true;
         }
-        child.add_space(18.0);
+        // "Ctrl+O" hint anchored to the bottom-right corner of the drop zone.
+        col.painter().text(
+            egui::pos2(drop_rect.right() - 10.0, drop_rect.bottom() - 10.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "Ctrl+O",
+            egui::FontId::monospace(10.5),
+            egui::Color32::from_gray(120),
+        );
 
-        if !self.prefs.recent.is_empty() {
-            child.separator();
-            child.add_space(6.0);
-            child.label(
-                egui::RichText::new("Recent")
-                    .color(egui::Color32::from_gray(160))
-                    .size(12.0),
-            );
-            child.add_space(4.0);
-            let recents = self.prefs.recent.clone();
-            for p in &recents {
+        col.advance_cursor_after_rect(drop_rect);
+        col.add_space(18.0);
+
+        // ── Recent folders ─────────────────────────────────────────────
+        let recents = self.prefs.recent.clone();
+        let recent_rows = recents.len().min(5);
+        if recent_rows > 0 {
+            col.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |row| {
+                row.add_space(2.0);
+                row.label(
+                    egui::RichText::new("RECENT")
+                        .size(10.5)
+                        .color(egui::Color32::from_gray(135))
+                        .strong(),
+                );
+            });
+            col.add_space(4.0);
+            for p in recents.iter().take(recent_rows) {
                 let label = recent_label(p);
-                let resp = child.add(
+                let full = p.display().to_string();
+                let row_resp = col.add(
                     egui::Button::new(
                         egui::RichText::new(label)
                             .size(13.0)
                             .color(egui::Color32::from_gray(220)),
                     )
                     .frame(false)
-                    .min_size(egui::vec2(card_w - 20.0, 22.0)),
+                    .min_size(egui::vec2(inner.width(), 24.0)),
                 );
-                if resp.clicked() {
+                if row_resp.clicked() {
                     self.actions.open_recent = Some(p.clone());
                 }
-                resp.on_hover_text(p.display().to_string());
+                row_resp.on_hover_text(full);
             }
+        }
+
+        // ── Bottom hint strip pinned to the card edge ──────────────────
+        let hp = ui.painter();
+        let dim = egui::Color32::from_gray(115);
+        let key = egui::Color32::from_gray(185);
+        let font = egui::FontId::proportional(11.0);
+        let hints: [(&str, &str); 3] = [("F1", "help"), ("Ctrl+O", "open"), ("Esc", "quit")];
+        let gap = 4.0_f32;
+        let sep = 14.0_f32;
+        let mut widths: Vec<(f32, f32)> = Vec::with_capacity(hints.len());
+        let mut total = 0.0_f32;
+        for (k, t) in &hints {
+            let wk = hp.layout_no_wrap(k.to_string(), font.clone(), key).rect.width();
+            let wt = hp.layout_no_wrap(t.to_string(), font.clone(), dim).rect.width();
+            widths.push((wk, wt));
+            total += wk + gap + wt;
+        }
+        total += sep * (hints.len() - 1) as f32;
+        let y = surface.bottom() - 14.0;
+        let mut x = surface.center().x - total / 2.0;
+        for ((k, t), (wk, wt)) in hints.iter().zip(widths.iter()) {
+            hp.text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, *k, font.clone(), key);
+            x += wk + gap;
+            hp.text(egui::pos2(x, y), egui::Align2::LEFT_CENTER, *t, font.clone(), dim);
+            x += wt + sep;
         }
     }
 
@@ -2442,6 +2616,20 @@ fn file_label(p: &Path) -> String {
 /// Compact one-line label for a recent-folder entry: the last two path
 /// segments ("Photos / 2024-08") so similarly-named folders are
 /// distinguishable without showing the whole absolute path.
+/// Window dimensions for the empty-state card. Sized just large enough to
+/// fit the header, drop zone, up-to-5 recent rows and the bottom hint strip
+/// — anything more and the user sees a tall empty rectangle.
+fn empty_state_card_size(recent_count: usize) -> (f32, f32) {
+    let n = recent_count.min(5);
+    let header = 4.0 + 26.0 + 1.0 + 16.0 + 16.0;
+    let drop_zone = 96.0 + 18.0;
+    let recents = if n == 0 { 0.0 } else { 14.0 + 4.0 + n as f32 * 24.0 + 8.0 };
+    let hint_strip = 24.0;
+    let padding = 22.0 * 2.0;
+    let h = header + drop_zone + recents + hint_strip + padding;
+    (440.0, h)
+}
+
 fn recent_label(p: &Path) -> String {
     let segs: Vec<String> = p
         .components()
