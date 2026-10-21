@@ -14,32 +14,40 @@ Brz, minimalan preglednik fotografija za Windows. Otvori folder pun slika, lista
 
 | Tipka | Akcija |
 |---|---|
-| **→** ili scroll dolje | Sljedeća slika |
-| **←** ili scroll gore | Prethodna slika |
+| **→** / **←** | Sljedeća / prethodna slika |
+| **Home** / **End** | Prva / zadnja slika |
+| Tipke miša *natrag* / *naprijed* | Prethodna / sljedeća slika |
+| Scroll kotačić ili **+** / **-** | Zoom in / out (scroll zumira prema kursoru) |
+| **0** | Reset zoom-a |
+| **Z** | HQ način (slike u punoj rezoluciji) |
 | **Q** / **W** | Rotiraj lijevo / desno |
 | **Space** | Označi favorit (★) |
-| **F** | Otvori filter favorita i kopiranje |
+| **F** | Filter: sve / samo favoriti / bez favorita |
+| **Shift+F** | Prozor favorita (kopiranje / premještanje) |
 | **I** | Prikaži EXIF info (datum, kamera, objektiv, ekspozicija) |
 | **Ctrl+O** | Otvori folder |
-| **Ctrl+C** | Kopiraj sliku u clipboard |
+| **Ctrl+C** | Kopiraj sliku u clipboard (puna rezolucija, okrenuta kako je prikazana) |
 | **Ctrl+E** | Prikaži sliku u Exploreru |
-| **+** / **-** ili Ctrl+scroll | Zoom in / out |
-| **0** | Reset zoom-a |
-| **F11** ili dvoklik | Fullscreen |
+| **F11**, **Alt+Enter** ili dvoklik | Fullscreen |
 | **Delete** | Premjesti sliku u smeće |
-| **Esc** | Zatvori prozor (ili izađi iz fullscreena) |
+| **Esc** | Zatvori dijalog, izađi iz fullscreena ili zatvori prozor |
+| **F1** | Popis svih prečaca |
 | **Desni klik** | Cijeli meni s opcijama |
-| Lijevi klik + povuci | Pomakni prozor |
+| Lijevi klik + povuci | Pomakni prozor (ili sliku kad je zumirana) |
 
 ## Workflow s favoritima
 
 1. Otvori folder pun slika.
 2. Listaj strelicama, pritisni **Space** za one koje ti se sviđaju.
-3. **F** otvara filter prozor s svim označenima.
+3. **Shift+F** otvara prozor sa svim označenima (**F** samo prebacuje prikaz između svih slika, favorita i ostalih).
 4. Otkvači one koje na kraju ne želiš.
-5. **Copy N selected to folder…** odabire destinaciju — gotovo.
+5. **Copy N selected to folder…** (ili **Cut…** za premještanje) odabire destinaciju — gotovo.
+
+RAW datoteke istog imena (npr. `IMG_1234.CR3` uz `IMG_1234.JPG`) idu zajedno sa slikom. Datoteke koje već postoje u odredištu se preskaču — ništa se ne prepisuje. Kopiranje ide u pozadini, pa prozor ostaje responzivan i kod velikih serija.
 
 Favoriti se spremaju u `.favorites.txt` u tom folderu (običan tekst, preživljava premještanje foldera).
+
+Folder se prati: nove, obrisane i izmijenjene slike pojavljuju se same, bez ponovnog otvaranja.
 
 ## Podržani formati
 
