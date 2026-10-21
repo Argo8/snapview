@@ -2962,7 +2962,6 @@ dependencies = [
  "rayon",
  "rfd",
  "trash",
- "walkdir",
  "winres",
 ]
 
