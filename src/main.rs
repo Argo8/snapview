@@ -46,6 +46,9 @@ const THUMB_KEEP_RADIUS: usize = 60;
 /// a copy in progress isn't decoded (and cached as failed) half-written.
 const FS_SETTLE: Duration = Duration::from_millis(350);
 const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
+/// Corner radius of the windowed view (the window is frameless and
+/// transparent; its visible shape is whatever we paint).
+const CORNER_RADIUS: f32 = 12.0;
 /// Toasts fade out over their last second.
 const TOAST_FADE: Duration = Duration::from_secs(1);
 
@@ -191,6 +194,42 @@ struct PendingActions {
     toggle_metadata: bool,
     show_in_explorer: bool,
     copy_to_clipboard: bool,
+}
+
+/// What a right-click menu item does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuCmd {
+    OpenFolder,
+    /// Index into the recent-folders list.
+    OpenRecent(usize),
+    RotateLeft,
+    RotateRight,
+    ToggleFavorite,
+    CycleFilter,
+    OpenFilter,
+    Delete,
+    CopyToClipboard,
+    ShowInExplorer,
+    ToggleFullscreen,
+    ToggleHq,
+    ToggleInfo,
+    Help,
+    Preferences,
+    Quit,
+}
+
+enum MenuEntry {
+    Item {
+        cmd: MenuCmd,
+        label: String,
+        /// Current state shown next to the label ("all", "3").
+        detail: Option<String>,
+        shortcut: &'static str,
+        checked: bool,
+    },
+    /// "Recent folders" submenu (hidden when empty).
+    Recent(Vec<PathBuf>),
+    Separator,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1850,8 +1889,6 @@ impl eframe::App for SnapView {
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         if self.animate_view(dt) { ctx.request_repaint(); }
 
-        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-
         let modal_open = self.pending_delete.is_some();
         let dialog_open = self.show_help || self.show_prefs;
 
@@ -1953,22 +1990,8 @@ impl eframe::App for SnapView {
             }
         }
 
-        // Windowed view auto-fits the window to the image's aspect, so when
-        // the image fills the window at zoom 1 we can drop the panel fill and
-        // let the rounded image itself be the visible "rounded window" — same
-        // effect in both portrait and landscape. Only while something is
-        // actually painted: while the first decode is still running (or it
-        // failed) the panel is the only thing painting pixels, and a
-        // transparent fill would leave the window invisible and click-through.
-        let drawable = self
-            .current_path()
-            .is_some_and(|p| self.pick_draw_path(&p).is_some());
-        // In empty state the rendered card IS the window — same trick as the
-        // rounded image in image mode. Drop the panel fill so the transparent
-        // window outside the rounded card lets the desktop show, and size the
-        // window down to the card so there's no big dark frame around it.
-        let suppress_dim = (drawable && !self.is_fullscreen && self.target_zoom <= 1.001)
-            || (empty_state && !self.is_fullscreen);
+        // In empty state the rendered card IS the window: size the window
+        // down to the card so there's no big dark frame around it.
         if empty_state && !self.is_fullscreen {
             let want = empty_state_card_size(self.prefs.recent.len(), self.show_help);
             let needs_resize = self
@@ -2008,14 +2031,14 @@ impl eframe::App for SnapView {
         // on an edge or corner.
         self.handle_window_resize(ctx);
 
-        // Fullscreen is fully opaque. Windowed, the panel fill is transparent
-        // in steady state for both image and empty modes (rounded image / card
-        // is the visible surface); it turns opaque during a resize settle
-        // window, when zoomed in (focused), and while loading / on error.
-        let placeholder = !empty_state && !drawable;
+        // Fullscreen is fully opaque. Windowed, the panel stays transparent
+        // and what's painted on it is the window's visible shape: the rounded
+        // image, the rounded start card, or a rounded backdrop behind a zoomed
+        // image / loading placeholder (see render_image). Only during a resize
+        // settle window does the whole rectangle go opaque.
         let bg_alpha: u8 = if self.is_fullscreen {
             255
-        } else if settling || placeholder || (focused && !suppress_dim) {
+        } else if settling {
             235
         } else {
             0
@@ -2418,6 +2441,11 @@ impl SnapView {
                 egui::Rect::from_center_size(avail_rect.center() + self.pan, egui::vec2(w, h) * scale)
             });
             let painter = ui.painter();
+            // Until the picture arrives the backdrop is the window's visible
+            // shape; a fully transparent window would be invisible and
+            // click-through.
+            let radius = if self.is_fullscreen { 0.0 } else { CORNER_RADIUS };
+            painter.rect_filled(avail_rect, radius, backdrop_color());
             if self.failed.contains(&path) {
                 painter.text(
                     avail_rect.center() - egui::vec2(0.0, 12.0),
@@ -2486,38 +2514,44 @@ impl SnapView {
         self.pan = self.pan.clamp(-lim, lim);
 
         let scale = base_scale * self.zoom;
-        let draw_w = src.x * scale;
-        let draw_h = src.y * scale;
-
+        // The unrotated quad; on screen it's turned by rotation_quarter.
+        let quad = src * scale;
         let center = avail_rect.center() + self.pan;
-        let angle = rotation_quarter as f32 * std::f32::consts::FRAC_PI_2;
-        // macOS-style continuous-ish corner rounding when windowed. In
-        // fullscreen the image bleeds to the display edges (no panel
-        // around it to round against).
-        let corner_radius = if self.is_fullscreen { 0.0 } else { 12.0 };
-        let shown = egui::Rect::from_center_size(center, egui::vec2(fit_w * scale, fit_h * scale));
-        if !opaque {
-            self.paint_checkerboard(ui, shown, corner_radius);
+        let shown = egui::Rect::from_center_size(center, egui::vec2(fit_w, fit_h) * scale);
+        if !self.is_fullscreen && (self.zoom > 1.001 || self.target_zoom > 1.001) {
+            // Zoomed in, the picture spills past the window and can't carry
+            // the rounded corners itself: paint the window's rounded shape
+            // behind it so the window stays rounded (this also fills the bars
+            // beside a picture that is still narrower than the window).
+            ui.painter().rect_filled(avail_rect, CORNER_RADIUS, backdrop_color());
         }
-
-        let mut mesh = egui::Mesh::with_texture(tex_id);
-        let local_rect =
-            egui::Rect::from_center_size(egui::Pos2::ZERO, egui::vec2(draw_w, draw_h));
-        let uv_rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        if corner_radius > 0.5 {
-            add_rounded_rect_with_uv(
-                &mut mesh,
-                local_rect,
-                uv_rect,
-                corner_radius,
-                egui::Color32::WHITE,
-            );
-        } else {
-            mesh.add_rect_with_uv(local_rect, uv_rect, egui::Color32::WHITE);
+        // Only the part inside the window is drawn, rounded where it meets a
+        // corner of the window or of the picture itself; where the window
+        // cuts straight through the picture the corner stays square. Nothing
+        // is rounded in fullscreen, where the picture bleeds to the edges.
+        let visible = shown.intersect(avail_rect);
+        if visible.is_positive() {
+            let radius = if self.is_fullscreen { 0.0 } else { CORNER_RADIUS };
+            let radii = corner_radii(visible, [avail_rect, shown], radius);
+            if !opaque {
+                self.paint_checkerboard(ui, visible, radii, shown.min);
+            }
+            // Texture coordinate of a screen point: undo the translation and
+            // the quarter turns, then normalize to the unrotated quad.
+            let uv_at = |p: egui::Pos2| {
+                let d = p - center;
+                let local = match rotation_quarter {
+                    1 => egui::vec2(d.y, -d.x),
+                    2 => -d,
+                    3 => egui::vec2(-d.y, d.x),
+                    _ => d,
+                };
+                egui::pos2(local.x / quad.x + 0.5, local.y / quad.y + 0.5)
+            };
+            let mut mesh = egui::Mesh::with_texture(tex_id);
+            add_rounded_rect(&mut mesh, visible, radii, egui::Color32::WHITE, uv_at);
+            ui.painter().add(egui::Shape::mesh(mesh));
         }
-        mesh.rotate(egui::emath::Rot2::from_angle(angle), egui::Pos2::ZERO);
-        mesh.translate(center.to_vec2());
-        ui.painter().add(egui::Shape::mesh(mesh));
 
         self.last_image_rect = Some(shown);
         self.handle_drop(ctx);
@@ -2525,8 +2559,9 @@ impl SnapView {
 
     /// Tile a checkerboard behind an image with transparency, so its clear
     /// parts read as transparent instead of showing the desktop through the
-    /// (transparent) window.
-    fn paint_checkerboard(&mut self, ui: &egui::Ui, rect: egui::Rect, radius: f32) {
+    /// (transparent) window. `origin` anchors the pattern to the picture so
+    /// it moves along when panning.
+    fn paint_checkerboard(&mut self, ui: &egui::Ui, rect: egui::Rect, radii: [f32; 4], origin: egui::Pos2) {
         const CELL: f32 = 8.0;
         let tex = self.checker.get_or_insert_with(|| {
             let (a, b) = (egui::Color32::from_gray(62), egui::Color32::from_gray(44));
@@ -2542,12 +2577,9 @@ impl SnapView {
             )
         });
         // One texel per cell; the 2x2 texture repeats every two cells.
-        let uv = egui::Rect::from_min_max(
-            egui::Pos2::ZERO,
-            egui::pos2(rect.width() / (2.0 * CELL), rect.height() / (2.0 * CELL)),
-        );
+        let uv_at = |p: egui::Pos2| ((p - origin) / (2.0 * CELL)).to_pos2();
         let mut mesh = egui::Mesh::with_texture(tex.id());
-        add_rounded_rect_with_uv(&mut mesh, rect, uv, radius, egui::Color32::WHITE);
+        add_rounded_rect(&mut mesh, rect, radii, egui::Color32::WHITE, uv_at);
         ui.painter().add(egui::Shape::mesh(mesh));
     }
 
@@ -2894,67 +2926,121 @@ impl SnapView {
             }
         }
 
-        let is_fav_now = self.current_path()
-            .map(|p| self.favorites.contains(&p))
-            .unwrap_or(false);
-        let fav_total = self.favorites.len();
-        let filter_label = self.filter_mode.label();
+        // Right-click menu. On Windows it's a native popup menu: it isn't
+        // clipped to our window, so it still fits when the window is small,
+        // and it opens on the right-button release like any Windows menu.
+        #[cfg(windows)]
+        if resp.secondary_clicked() {
+            let entries = self.context_menu_entries();
+            if let Some(cmd) = show_native_menu(&entries, !self.effective_light(ctx)) {
+                self.run_menu_cmd(cmd);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let mut chosen = None;
+            resp.context_menu(|ui| chosen = egui_context_menu(ui, &self.context_menu_entries()));
+            if let Some(cmd) = chosen {
+                self.run_menu_cmd(cmd);
+            }
+        }
+    }
 
-        let recents = self.prefs.recent.clone();
-        resp.context_menu(|ui| {
-            if ui.button("Open folder…  (Ctrl+O)").clicked() {
-                self.actions.open_folder = true;
-                ui.close_menu();
-            }
-            if !recents.is_empty() {
-                ui.menu_button("Recent folders", |ui| {
-                    for p in &recents {
-                        if ui
-                            .button(recent_label(p))
-                            .on_hover_text(p.display().to_string())
-                            .clicked()
-                        {
-                            self.actions.open_recent = Some(p.clone());
-                            ui.close_menu();
-                        }
-                    }
-                });
-            }
-            ui.separator();
-            if ui.button("Rotate left  (Q)").clicked() { self.actions.rot_left = true; ui.close_menu(); }
-            if ui.button("Rotate right  (W)").clicked() { self.actions.rot_right = true; ui.close_menu(); }
-            ui.separator();
-            let label = if is_fav_now { "Unmark favorite  (Space)" } else { "Mark favorite  (Space)" };
-            if ui.button(label).clicked() { self.actions.toggle_fav = true; ui.close_menu(); }
-            if ui.button(format!("Cycle filter  (F)  [{}]", filter_label)).clicked() {
-                self.actions.cycle_filter = true;
-                ui.close_menu();
-            }
-            if ui.button(format!("Filter favorites window…  (Shift+F)  [{}]", fav_total)).clicked() {
-                self.actions.open_filter = true;
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("Move to trash  (Delete)").clicked() { self.actions.delete = true; ui.close_menu(); }
-            ui.separator();
-            if ui.button("Copy image to clipboard  (Ctrl+C)").clicked() { self.actions.copy_to_clipboard = true; ui.close_menu(); }
-            if ui.button("Show in file manager  (Ctrl+E)").clicked() { self.actions.show_in_explorer = true; ui.close_menu(); }
-            ui.separator();
-            if ui.button("Toggle fullscreen  (F11)").clicked() { self.actions.toggle_max = true; ui.close_menu(); }
-            ui.separator();
-            let hq_label = if self.hq_mode.load(Ordering::Relaxed) {
-                "HQ mode  (Z)  [on]"
-            } else {
-                "HQ mode  (Z)"
-            };
-            if ui.button(hq_label).clicked() { self.actions.request_hq = true; ui.close_menu(); }
-            ui.separator();
-            let info_label = if self.show_metadata { "Hide image info  (I)" } else { "Show image info  (I)" };
-            if ui.button(info_label).clicked() { self.actions.toggle_metadata = true; ui.close_menu(); }
-            if ui.button("Keyboard shortcuts  (F1)").clicked() { self.actions.toggle_help = true; ui.close_menu(); }
-            if ui.button("Preferences…").clicked() { self.actions.show_prefs = true; ui.close_menu(); }
-            if ui.button("Quit  (Esc)").clicked() { self.actions.quit = true; ui.close_menu(); }
-        });
+    /// The right-click menu's contents, shared by the native (Windows) and
+    /// the egui menu.
+    fn context_menu_entries(&self) -> Vec<MenuEntry> {
+        let item = |cmd, label: &str, shortcut| MenuEntry::Item {
+            cmd,
+            label: label.to_string(),
+            detail: None,
+            shortcut,
+            checked: false,
+        };
+        let is_fav = self.current_path().is_some_and(|p| self.favorites.contains(&p));
+        vec![
+            item(MenuCmd::OpenFolder, "Open folder…", "Ctrl+O"),
+            MenuEntry::Recent(self.prefs.recent.clone()),
+            MenuEntry::Separator,
+            item(MenuCmd::RotateLeft, "Rotate left", "Q"),
+            item(MenuCmd::RotateRight, "Rotate right", "W"),
+            MenuEntry::Separator,
+            item(
+                MenuCmd::ToggleFavorite,
+                if is_fav { "Unmark favorite" } else { "Mark favorite" },
+                "Space",
+            ),
+            MenuEntry::Item {
+                cmd: MenuCmd::CycleFilter,
+                label: "Cycle filter".into(),
+                detail: Some(self.filter_mode.label().into()),
+                shortcut: "F",
+                checked: false,
+            },
+            MenuEntry::Item {
+                cmd: MenuCmd::OpenFilter,
+                label: "Filter favorites window…".into(),
+                detail: Some(self.favorites.len().to_string()),
+                shortcut: "Shift+F",
+                checked: false,
+            },
+            MenuEntry::Separator,
+            item(MenuCmd::Delete, "Move to trash", "Delete"),
+            MenuEntry::Separator,
+            item(MenuCmd::CopyToClipboard, "Copy image to clipboard", "Ctrl+C"),
+            item(
+                MenuCmd::ShowInExplorer,
+                if cfg!(windows) { "Show in Explorer" } else { "Show in file manager" },
+                "Ctrl+E",
+            ),
+            MenuEntry::Separator,
+            MenuEntry::Item {
+                cmd: MenuCmd::ToggleFullscreen,
+                label: "Fullscreen".into(),
+                detail: None,
+                shortcut: "F11",
+                checked: self.is_fullscreen,
+            },
+            MenuEntry::Item {
+                cmd: MenuCmd::ToggleHq,
+                label: "HQ mode".into(),
+                detail: None,
+                shortcut: "Z",
+                checked: self.hq_mode.load(Ordering::Relaxed),
+            },
+            MenuEntry::Item {
+                cmd: MenuCmd::ToggleInfo,
+                label: "Image info".into(),
+                detail: None,
+                shortcut: "I",
+                checked: self.show_metadata,
+            },
+            MenuEntry::Separator,
+            item(MenuCmd::Help, "Keyboard shortcuts", "F1"),
+            item(MenuCmd::Preferences, "Preferences…", ""),
+            item(MenuCmd::Quit, "Quit", "Esc"),
+        ]
+    }
+
+    fn run_menu_cmd(&mut self, cmd: MenuCmd) {
+        let a = &mut self.actions;
+        match cmd {
+            MenuCmd::OpenFolder => a.open_folder = true,
+            MenuCmd::OpenRecent(i) => a.open_recent = self.prefs.recent.get(i).cloned(),
+            MenuCmd::RotateLeft => a.rot_left = true,
+            MenuCmd::RotateRight => a.rot_right = true,
+            MenuCmd::ToggleFavorite => a.toggle_fav = true,
+            MenuCmd::CycleFilter => a.cycle_filter = true,
+            MenuCmd::OpenFilter => a.open_filter = true,
+            MenuCmd::Delete => a.delete = true,
+            MenuCmd::CopyToClipboard => a.copy_to_clipboard = true,
+            MenuCmd::ShowInExplorer => a.show_in_explorer = true,
+            MenuCmd::ToggleFullscreen => a.toggle_max = true,
+            MenuCmd::ToggleHq => a.request_hq = true,
+            MenuCmd::ToggleInfo => a.toggle_metadata = true,
+            MenuCmd::Help => a.toggle_help = true,
+            MenuCmd::Preferences => a.show_prefs = true,
+            MenuCmd::Quit => a.quit = true,
+        }
     }
 
     fn handle_drop(&mut self, ctx: &egui::Context) {
@@ -3340,6 +3426,225 @@ fn draw_chevron(painter: &egui::Painter, rect: egui::Rect, hovered: bool, points
     let tip = egui::pos2(tip_x, mid_y);
     painter.line_segment([top, tip], stroke);
     painter.line_segment([bot, tip], stroke);
+}
+
+/// The right-click menu as an egui popup. Used where there's no native menu.
+#[cfg(not(windows))]
+fn egui_context_menu(ui: &mut egui::Ui, entries: &[MenuEntry]) -> Option<MenuCmd> {
+    let mut chosen = None;
+    for entry in entries {
+        match entry {
+            MenuEntry::Separator => {
+                ui.separator();
+            }
+            MenuEntry::Recent(paths) => {
+                if paths.is_empty() {
+                    continue;
+                }
+                ui.menu_button("Recent folders", |ui| {
+                    for (i, p) in paths.iter().enumerate() {
+                        if ui
+                            .button(recent_label(p))
+                            .on_hover_text(p.display().to_string())
+                            .clicked()
+                        {
+                            chosen = Some(MenuCmd::OpenRecent(i));
+                            ui.close_menu();
+                        }
+                    }
+                });
+            }
+            MenuEntry::Item { cmd, label, detail, shortcut, checked } => {
+                let mut text = label.clone();
+                if !shortcut.is_empty() {
+                    text.push_str(&format!("  ({})", shortcut));
+                }
+                if let Some(d) = detail {
+                    text.push_str(&format!("  [{}]", d));
+                }
+                if *checked {
+                    text.push_str("  [on]");
+                }
+                if ui.button(text).clicked() {
+                    chosen = Some(*cmd);
+                    ui.close_menu();
+                }
+            }
+        }
+    }
+    chosen
+}
+
+/// The right-click menu as a native Win32 popup menu at the cursor. Unlike
+/// an egui popup it isn't confined to our window, and Windows keeps it on
+/// screen, handles the keyboard and closes it on an outside click. Blocks
+/// until the menu closes, like any modal Win32 menu.
+#[cfg(windows)]
+fn show_native_menu(entries: &[MenuEntry], dark: bool) -> Option<MenuCmd> {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn CreatePopupMenu() -> isize;
+        fn AppendMenuW(menu: isize, flags: u32, id: usize, text: *const u16) -> i32;
+        fn TrackPopupMenuEx(
+            menu: isize,
+            flags: u32,
+            x: i32,
+            y: i32,
+            hwnd: isize,
+            params: *const std::ffi::c_void,
+        ) -> i32;
+        fn DestroyMenu(menu: isize) -> i32;
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn GetActiveWindow() -> isize;
+        fn GetForegroundWindow() -> isize;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+    }
+    const MF_STRING: u32 = 0x0000;
+    const MF_CHECKED: u32 = 0x0008;
+    const MF_POPUP: u32 = 0x0010;
+    const MF_SEPARATOR: u32 = 0x0800;
+    const TPM_RIGHTBUTTON: u32 = 0x0002;
+    const TPM_NONOTIFY: u32 = 0x0080;
+    const TPM_RETURNCMD: u32 = 0x0100;
+
+    // '&' marks a mnemonic in menu text; doubled it shows up literally.
+    fn wide(s: &str) -> Vec<u16> {
+        s.replace('&', "&&").encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    // Command ids are 1-based indexes into `cmds`; 0 means "dismissed".
+    let mut cmds: Vec<MenuCmd> = Vec::new();
+    unsafe {
+        let hwnd = match GetActiveWindow() {
+            0 => GetForegroundWindow(),
+            h => h,
+        };
+        if hwnd == 0 {
+            return None;
+        }
+        let menu = CreatePopupMenu();
+        if menu == 0 {
+            return None;
+        }
+        for entry in entries {
+            match entry {
+                MenuEntry::Separator => {
+                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+                }
+                MenuEntry::Recent(paths) => {
+                    if paths.is_empty() {
+                        continue;
+                    }
+                    let sub = CreatePopupMenu();
+                    if sub == 0 {
+                        continue;
+                    }
+                    for (i, p) in paths.iter().enumerate() {
+                        cmds.push(MenuCmd::OpenRecent(i));
+                        AppendMenuW(sub, MF_STRING, cmds.len(), wide(&p.display().to_string()).as_ptr());
+                    }
+                    // The parent menu owns the submenu; DestroyMenu frees both.
+                    AppendMenuW(menu, MF_POPUP, sub as usize, wide("Recent folders").as_ptr());
+                }
+                MenuEntry::Item { cmd, label, detail, shortcut, checked } => {
+                    cmds.push(*cmd);
+                    let mut text = label.clone();
+                    if let Some(d) = detail {
+                        text.push_str(&format!("  ({})", d));
+                    }
+                    if !shortcut.is_empty() {
+                        // Text after a tab is right-aligned as the accelerator.
+                        text.push('\t');
+                        text.push_str(shortcut);
+                    }
+                    let flags = MF_STRING | if *checked { MF_CHECKED } else { 0 };
+                    AppendMenuW(menu, flags, cmds.len(), wide(&text).as_ptr());
+                }
+            }
+        }
+        set_native_menu_theme(dark);
+        let mut pt = Point { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        // Without the window in the foreground the menu wouldn't close when
+        // the user clicks somewhere else.
+        SetForegroundWindow(hwnd);
+        let id = TrackPopupMenuEx(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            hwnd,
+            std::ptr::null(),
+        );
+        DestroyMenu(menu);
+        if id <= 0 {
+            return None;
+        }
+        cmds.get(id as usize - 1).copied()
+    }
+}
+
+/// Make Win32 popup menus follow the app's theme. Windows only offers this
+/// through two undocumented uxtheme exports, SetPreferredAppMode (#135) and
+/// FlushMenuThemes (#136), stable since Windows 10 1903 (build 18362) and
+/// used by many apps for exactly this. Older Windows has other functions at
+/// those ordinals, so they're only touched on 18362+; elsewhere menus keep
+/// the default look.
+#[cfg(windows)]
+fn set_native_menu_theme(dark: bool) {
+    #[repr(C)]
+    struct OsVersionInfo {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        service_pack: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> isize;
+        fn GetProcAddress(module: isize, name: *const u8) -> *const std::ffi::c_void;
+    }
+    const FORCE_DARK: i32 = 2;
+    const FORCE_LIGHT: i32 = 3;
+    unsafe {
+        let mut v = OsVersionInfo {
+            size: std::mem::size_of::<OsVersionInfo>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            service_pack: [0; 128],
+        };
+        if RtlGetVersion(&mut v) != 0 || v.major < 10 || v.build < 18362 {
+            return;
+        }
+        let name: Vec<u16> = "uxtheme.dll".encode_utf16().chain(std::iter::once(0)).collect();
+        let uxtheme = LoadLibraryW(name.as_ptr());
+        if uxtheme == 0 {
+            return;
+        }
+        // Exports by ordinal: the "name" pointer carries the ordinal.
+        let set_mode = GetProcAddress(uxtheme, 135 as *const u8);
+        let flush = GetProcAddress(uxtheme, 136 as *const u8);
+        if set_mode.is_null() || flush.is_null() {
+            return;
+        }
+        let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+        let flush: unsafe extern "system" fn() = std::mem::transmute(flush);
+        set_mode(if dark { FORCE_DARK } else { FORCE_LIGHT });
+        flush();
+    }
 }
 
 /// Text with a soft drop shadow, so labels stay readable over bright photos.
@@ -4265,61 +4570,66 @@ fn full_texture_options() -> egui::TextureOptions {
     }
 }
 
-/// Builds a textured rounded rect into an existing Mesh. Per-vertex UV is
-/// interpolated linearly from the position inside `rect`, so the caller can
-/// freely rotate/translate the resulting Mesh and the texture sticks with
-/// the geometry (rounded corners rotate together with the image content).
-fn add_rounded_rect_with_uv(
-    mesh: &mut egui::Mesh,
-    rect: egui::Rect,
-    uv: egui::Rect,
-    radius: f32,
-    color: egui::Color32,
-) {
-    let r = radius.clamp(0.0, rect.width().min(rect.height()) * 0.5);
-    if r < 0.5 {
-        mesh.add_rect_with_uv(rect, uv, color);
-        return;
-    }
-    use std::f32::consts::{FRAC_PI_2, PI};
-    let segments: usize = 10;
-    // Corner arcs walked clockwise: top-left, top-right, bottom-right, bottom-left.
-    // Angles use egui's coord system (y grows downward).
-    let corners = [
-        (egui::pos2(rect.min.x + r, rect.min.y + r), PI, 1.5 * PI),
-        (egui::pos2(rect.max.x - r, rect.min.y + r), 1.5 * PI, 2.0 * PI),
-        (egui::pos2(rect.max.x - r, rect.max.y - r), 0.0, FRAC_PI_2),
-        (egui::pos2(rect.min.x + r, rect.max.y - r), FRAC_PI_2, PI),
-    ];
-    let center = rect.center();
-    let center_uv = egui::pos2(uv.min.x + uv.width() * 0.5, uv.min.y + uv.height() * 0.5);
-    let base = mesh.vertices.len() as u32;
-    mesh.vertices.push(egui::epaint::Vertex {
-        pos: center,
-        uv: center_uv,
-        color,
-    });
-    let mut perim_count: u32 = 0;
-    for &(c, a0, a1) in &corners {
-        for i in 0..=segments {
-            let t = i as f32 / segments as f32;
-            let a = a0 + (a1 - a0) * t;
-            let p = egui::pos2(c.x + r * a.cos(), c.y + r * a.sin());
-            let u = uv.min.x + (p.x - rect.min.x) / rect.width() * uv.width();
-            let v = uv.min.y + (p.y - rect.min.y) / rect.height() * uv.height();
-            mesh.vertices.push(egui::epaint::Vertex {
-                pos: p,
-                uv: egui::pos2(u, v),
-                color,
-            });
-            perim_count += 1;
+/// The dark backdrop behind a zoomed picture or a loading placeholder.
+fn backdrop_color() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(13, 13, 13, 235)
+}
+
+/// Corner radii (top-left, top-right, bottom-right, bottom-left) for `rect`:
+/// `radius` where a corner coincides with the same corner of one of
+/// `shapes`, square everywhere else.
+fn corner_radii(rect: egui::Rect, shapes: [egui::Rect; 2], radius: f32) -> [f32; 4] {
+    let corners = |r: egui::Rect| [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+    let own = corners(rect);
+    let mut radii = [0.0; 4];
+    for (i, c) in own.iter().enumerate() {
+        if shapes.iter().any(|s| corners(*s)[i].distance(*c) < 0.5) {
+            radii[i] = radius;
         }
     }
-    for i in 0..perim_count {
-        let next = (i + 1) % perim_count;
-        mesh.indices.push(base);
-        mesh.indices.push(base + 1 + i);
-        mesh.indices.push(base + 1 + next);
+    radii
+}
+
+/// Builds a rounded rect into an existing Mesh as a triangle fan, with its
+/// own radius per corner (top-left, top-right, bottom-right, bottom-left;
+/// 0 = square). `uv_at` gives each vertex's texture coordinate from its
+/// screen position, so the texture can sit under the shape with any
+/// transform (zoom, pan, quarter-turn rotation).
+fn add_rounded_rect(
+    mesh: &mut egui::Mesh,
+    rect: egui::Rect,
+    radii: [f32; 4],
+    color: egui::Color32,
+    uv_at: impl Fn(egui::Pos2) -> egui::Pos2,
+) {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    const SEGMENTS: usize = 10;
+    let max_r = rect.width().min(rect.height()) * 0.5;
+    let r = radii.map(|r| r.clamp(0.0, max_r));
+    // Corner arcs walked clockwise: top-left, top-right, bottom-right,
+    // bottom-left. Angles use egui's coord system (y grows downward).
+    let corners = [
+        (egui::pos2(rect.min.x + r[0], rect.min.y + r[0]), r[0], PI),
+        (egui::pos2(rect.max.x - r[1], rect.min.y + r[1]), r[1], 1.5 * PI),
+        (egui::pos2(rect.max.x - r[2], rect.max.y - r[2]), r[2], 0.0),
+        (egui::pos2(rect.min.x + r[3], rect.max.y - r[3]), r[3], FRAC_PI_2),
+    ];
+    let vertex = |pos: egui::Pos2| egui::epaint::Vertex { pos, uv: uv_at(pos), color };
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.push(vertex(rect.center()));
+    for &(c, radius, start) in &corners {
+        if radius < 0.5 {
+            mesh.vertices.push(vertex(c));
+            continue;
+        }
+        for i in 0..=SEGMENTS {
+            let a = start + FRAC_PI_2 * i as f32 / SEGMENTS as f32;
+            mesh.vertices.push(vertex(egui::pos2(c.x + radius * a.cos(), c.y + radius * a.sin())));
+        }
+    }
+    let perimeter = mesh.vertices.len() as u32 - base - 1;
+    for i in 0..perimeter {
+        mesh.indices.extend([base, base + 1 + i, base + 1 + (i + 1) % perimeter]);
     }
 }
 
@@ -4833,6 +5143,21 @@ mod tests {
         assert!((w / h - 8.0).abs() < 0.01);
         assert_eq!(aspect_class(3024, 4032), 1);
         assert_eq!(aspect_class(4032, 3024), 0);
+    }
+
+    #[test]
+    fn rounded_corners_follow_the_window_and_the_picture() {
+        let r = CORNER_RADIUS;
+        let window = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        // Fit, smaller than the window: the picture's own corners.
+        let fit = egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(600.0, 600.0));
+        assert_eq!(corner_radii(fit.intersect(window), [window, fit], r), [r; 4]);
+        // Zoomed past the window on every side: the window's corners.
+        let zoomed = egui::Rect::from_min_size(egui::pos2(-300.0, -200.0), egui::vec2(1600.0, 1200.0));
+        assert_eq!(corner_radii(zoomed.intersect(window), [window, zoomed], r), [r; 4]);
+        // Taller than the window but narrower: cut flat at top and bottom.
+        let band = egui::Rect::from_min_size(egui::pos2(200.0, -100.0), egui::vec2(400.0, 800.0));
+        assert_eq!(corner_radii(band.intersect(window), [window, band], r), [0.0; 4]);
     }
 
     #[test]
