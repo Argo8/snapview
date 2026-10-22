@@ -34,6 +34,7 @@ Brz, minimalan preglednik fotografija za Windows. Otvori folder pun slika, lista
 | **F1** | Popis svih prečaca |
 | **Desni klik** | Cijeli meni s opcijama |
 | Lijevi klik + povuci | Pomakni prozor (ili sliku kad je zumirana) |
+| Povuci rub prozora | Povećaj / smanji sliku (prozor uvijek završava na rubu slike) |
 
 ## Workflow s favoritima
 
