@@ -49,8 +49,18 @@ const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
 /// Corner radius of the windowed view (the window is frameless and
 /// transparent; its visible shape is whatever we paint).
 const CORNER_RADIUS: f32 = 12.0;
+/// Shorter side of the window, at least; tiny pictures are scaled up to it.
+const MIN_WINDOW_SIDE: f32 = 160.0;
+/// How long a window size must hold still after an edge drag before it's
+/// taken as the user's choice.
+const RESIZE_SETTLE: Duration = Duration::from_millis(250);
 /// Toasts fade out over their last second.
 const TOAST_FADE: Duration = Duration::from_secs(1);
+/// Dialog titles; egui also keys each window's state by its title.
+const HELP_TITLE: &str = "Keyboard shortcuts";
+const PREFS_TITLE: &str = "Preferences";
+const DELETE_TITLE: &str = "Delete?";
+const FILTER_TITLE: &str = "Filter favorites & copy/cut";
 
 fn main() -> Result<(), eframe::Error> {
     #[cfg(windows)]
@@ -67,17 +77,17 @@ fn main() -> Result<(), eframe::Error> {
     // startup creating the window and GL context, and the first image can
     // decode in parallel with that instead of after it.
     let loader = Loader::spawn();
-    let mut initial_aspect = None;
+    let mut initial_picture = None;
     if let Some(p) = initial_path.as_ref().filter(|p| p.is_file()) {
         loader.full_q.replace(std::slice::from_ref(p));
         loader.probe_q.enqueue_back(std::slice::from_ref(p));
-        // Header-only (~1 ms), so the window can open at the image's aspect
+        // Header-only (~1 ms), so the window can open at the picture's size
         // instead of resizing right after the first frame.
-        initial_aspect = probe_image(p).display_aspect();
+        initial_picture = probe_image(p).display_size();
     }
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size(initial_window_size(initial_aspect))
+        .with_inner_size(initial_window_size(initial_picture))
         .with_decorations(false)
         .with_transparent(true)
         .with_title("snapview");
@@ -99,20 +109,14 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-/// Window size for the first image: DEFAULT_WINDOW_HEIGHT tall at the
-/// image's aspect, with very wide or very tall images clamped so the window
-/// stays a sane size before we know the monitor.
-fn initial_window_size(aspect: Option<f32>) -> [f32; 2] {
-    let Some(aspect) = aspect.filter(|a| a.is_finite() && *a > 0.0) else {
-        return [1200.0, DEFAULT_WINDOW_HEIGHT];
-    };
-    let mut h = DEFAULT_WINDOW_HEIGHT;
-    let mut w = h * aspect;
-    if w > 1600.0 {
-        w = 1600.0;
-        h = (w / aspect).max(200.0);
+/// Window size for the first picture (pixel size from the probe). The
+/// monitor and its scaling aren't known before the window exists, so this
+/// assumes a 1080p screen at 100%; fit_window corrects it on the first frames.
+fn initial_window_size(picture: Option<egui::Vec2>) -> egui::Vec2 {
+    match picture {
+        Some(p) => fit_picture_size(p, DEFAULT_WINDOW_HEIGHT, Some(egui::vec2(1920.0, 1080.0))),
+        None => egui::vec2(1200.0, DEFAULT_WINDOW_HEIGHT),
     }
-    [w.max(320.0), h]
 }
 
 /// Set an AppUserModelID so Windows can group our windows correctly in the
@@ -361,20 +365,15 @@ struct SnapView {
     applied_light: Option<bool>,
 
     is_fullscreen: bool,
-    last_resized_path: Option<PathBuf>,
-    last_aspect_class: Option<i8>,
-    // Frames left to keep the panel background opaque after an auto-resize.
-    // Without this, the window is transparent while the OS animates the
-    // resize, and the desktop briefly shows through the rounded corners.
-    resize_settle_frames: u8,
-    // Last size we requested for the empty-state card. We re-request a resize
-    // whenever the desired size changes (recent count grew, F1 help opened
-    // and the card needs to expand to fit the dialog, etc.). Cleared when we
-    // leave empty state so a fresh entry resizes again.
-    empty_state_size: Option<(f32, f32)>,
-    // Set while the window is shrunk to the start-screen card, so the next
-    // image gets a normal viewing size instead of one derived from the card.
-    restore_window_size: bool,
+    /// Height (points) a large picture gets in windowed mode. Follows the
+    /// user when they resize the window by an edge.
+    view_height: f32,
+    /// Last inner window size we asked the OS for.
+    requested_size: Option<egui::Vec2>,
+    /// An edge drag in progress; adopted once the size holds still.
+    manual_resize: Option<ManualResize>,
+    /// Window size the user picked for a picture by resizing the window.
+    size_override: Option<(PathBuf, egui::Vec2)>,
     actions: PendingActions,
 
     filter_mode: FilterMode,
@@ -402,6 +401,25 @@ struct SnapView {
     evict_dirty: bool,
     /// 2x2 checkerboard tiled behind images that have transparency.
     checker: Option<egui::TextureHandle>,
+}
+
+struct ManualResize {
+    start_size: egui::Vec2,
+    /// The picture's scale (points per pixel) when the drag began.
+    start_scale: f32,
+    last_size: egui::Vec2,
+    changed_at: Instant,
+}
+
+impl ManualResize {
+    /// Picture scale that follows the drag: it grows or shrinks with
+    /// whichever side of the window changed more, so pulling a single edge
+    /// resizes the picture just like pulling a corner.
+    fn scale(&self, window: egui::Vec2) -> f32 {
+        let (rx, ry) = (window.x / self.start_size.x, window.y / self.start_size.y);
+        let r = if rx.ln().abs() >= ry.ln().abs() { rx } else { ry };
+        self.start_scale * r
+    }
 }
 
 struct FullTexture {
@@ -711,11 +729,10 @@ impl SnapView {
             prefs: load_preferences().unwrap_or_default(),
             applied_light: None,
             is_fullscreen: false,
-            last_resized_path: None,
-            last_aspect_class: None,
-            resize_settle_frames: 0,
-            empty_state_size: None,
-            restore_window_size: false,
+            view_height: DEFAULT_WINDOW_HEIGHT,
+            requested_size: None,
+            manual_resize: None,
+            size_override: None,
             actions: PendingActions::default(),
             filter_mode: FilterMode::All,
             toast: None,
@@ -1621,7 +1638,7 @@ impl SnapView {
     /// band of any edge/corner of the window, swap the cursor to the matching
     /// resize glyph and, on primary press, hand off to the OS via
     /// `ViewportCommand::BeginResize`. Skipped in fullscreen.
-    fn handle_window_resize(&self, ctx: &egui::Context) {
+    fn handle_window_resize(&mut self, ctx: &egui::Context) {
         if self.is_fullscreen { return; }
         let rect = ctx.screen_rect();
         let pos = match ctx.input(|i| i.pointer.hover_pos()) {
@@ -1687,76 +1704,212 @@ impl SnapView {
 
         if ctx.input(|i| i.pointer.primary_pressed()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+            let size = ctx.screen_rect().size();
+            let start_scale = self
+                .current_path()
+                .and_then(|p| {
+                    let (w, h) = self.display_dims(&p)?;
+                    Some(self.base_scale(&p, ctx, egui::vec2(w as f32, h as f32), size))
+                })
+                .unwrap_or(1.0);
+            self.manual_resize = Some(ManualResize {
+                start_size: size,
+                start_scale,
+                last_size: size,
+                changed_at: Instant::now(),
+            });
         }
     }
 
-    /// When windowed, only on a portrait ↔ landscape transition: rescale the
-    /// window's width to the new image's aspect, leave height untouched, and
-    /// reposition so the window stays centered around its previous middle.
-    /// Goal is the visual effect "the picture shrunk into portrait" rather
-    /// than "the window jumped sideways". Coming from the start-screen card,
-    /// the window instead grows back to a normal viewing size around the
-    /// card's center.
-    fn maybe_resize_window_to_image(&mut self, ctx: &egui::Context) {
-        let path = match self.current_path() { Some(p) => p, None => return };
-        if self.last_resized_path.as_ref() == Some(&path) { return; }
-        // Only resize once the new image actually has something to render —
-        // otherwise the OS resizes the window before the new content lands
-        // and the user sees the desktop behind for a frame or two.
-        let new_ready = self.textures.contains_key(&path)
-            || self.thumb_textures.contains_key(&path);
-        if !new_ready { return; }
-        let (iw, ih) = match self.display_dims(&path) { Some(d) => d, None => return };
-        if iw == 0 || ih == 0 { return; }
-        let aspect = iw as f32 / ih as f32;
-        let class = aspect_class(iw, ih);
-        let restore = self.restore_window_size;
-
-        // Skip when aspect class hasn't changed: keep current window unchanged.
-        if !restore && Some(class) == self.last_aspect_class {
-            self.last_resized_path = Some(path);
+    /// Windowed mode: keep the OS window exactly the size of what's shown —
+    /// the picture at zoom 1, the start card, or a dialog that needs more
+    /// room than the picture — so the (transparent) window never sticks out
+    /// past the picture: nothing dims beyond it and no invisible part of the
+    /// window sits in front of other apps. Resizes keep the window's center.
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        if self.is_fullscreen {
             return;
         }
+        let (inner, monitor, parked) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.inner_rect, v.monitor_size, v.minimized == Some(true) || v.maximized == Some(true))
+        });
+        // Minimized or snapped to the whole screen: the OS owns the size,
+        // and the picture is fitted again once the window is back.
+        if parked {
+            self.requested_size = None;
+            return;
+        }
+        let Some(inner) = inner else { return };
 
-        // Need actual window geometry on screen to recenter. egui makes this
-        // available via ViewportInfo; if it's not populated yet, defer to
-        // next frame.
-        let (outer, monitor) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().monitor_size));
-        let outer = match outer {
-            Some(r) => r,
-            None => return,
-        };
-        let height = if restore { DEFAULT_WINDOW_HEIGHT } else { outer.height() };
-        let (new_w, new_h) = fit_window_to_aspect(aspect, height, monitor);
-        let center = outer.center();
-        let mut pos = if restore {
-            center - egui::vec2(new_w, new_h) / 2.0
+        // An edge drag is in progress: don't fight it. Once the button is up
+        // and the size has held still for a moment, the drag sets the
+        // picture's size.
+        if let Some(m) = self.manual_resize.as_mut() {
+            if (inner.size() - m.last_size).length() > 0.5 {
+                m.last_size = inner.size();
+                m.changed_at = Instant::now();
+            }
+            let quiet = m.changed_at.elapsed();
+            if quiet < RESIZE_SETTLE || mouse_button_held() {
+                let poll = RESIZE_SETTLE.saturating_sub(quiet).max(Duration::from_millis(50));
+                ctx.request_repaint_after(poll);
+                return;
+            }
+        }
+        if let Some(m) = self.manual_resize.take() {
+            if (m.last_size - m.start_size).length() > 1.0 {
+                self.adopt_manual_size(&m, inner.size(), ctx);
+            }
+        }
+
+        let want = if self.images.is_empty() {
+            empty_state_card_size(self.prefs.recent.len())
         } else {
-            egui::pos2(center.x - new_w / 2.0, outer.top())
+            let Some(path) = self.current_path() else { return };
+            // Wait until the new picture can be painted; resizing first would
+            // show the old one stretched or the desktop for a frame.
+            if !self.textures.contains_key(&path) && !self.thumb_textures.contains_key(&path) {
+                return;
+            }
+            let Some(size) = self.picture_window_size(&path, ctx) else { return };
+            size
         };
+        let want = self.dialog_min_size(ctx).map_or(want, |d| want.max(d));
+        if self.requested_size.is_some_and(|r| (r - want).length() < 1.0) {
+            return;
+        }
+        self.requested_size = Some(want);
+        if (inner.size() - want).length() < 1.0 {
+            return;
+        }
+        let center = inner.center();
+        let mut pos = center - want / 2.0;
         // Keep the window on screen (a panorama next to the screen edge, or
         // the card growing near the top). Only when the window is on a monitor
         // anchored at the origin — the one coordinate system we know.
         if let Some(m) = monitor {
             if (0.0..=m.x).contains(&center.x) && (0.0..=m.y).contains(&center.y) {
-                pos.x = pos.x.clamp(0.0, (m.x - new_w).max(0.0));
-                pos.y = pos.y.clamp(0.0, (m.y - new_h).max(0.0));
+                pos.x = pos.x.clamp(0.0, (m.x - want.x).max(0.0));
+                pos.y = pos.y.clamp(0.0, (m.y - want.y).max(0.0));
             }
         }
-        self.restore_window_size = false;
-        self.last_aspect_class = Some(class);
-        self.last_resized_path = Some(path);
-
-        if (outer.width() - new_w).abs() < 2.0 && (outer.height() - new_h).abs() < 2.0 {
-            return;
-        }
-
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(new_w, new_h)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-        // Keep the window opaque for a few frames so the user doesn't see the
-        // desktop through the rounded corners while the OS animates the resize.
-        self.resize_settle_frames = 12;
         ctx.request_repaint();
+    }
+
+    /// After an edge drag the picture keeps the size the drag gave it (it
+    /// may be scaled up past its pixel size), within the monitor. That size
+    /// sticks for this picture; if it was a large one, shown at the shared
+    /// view height, the next large ones get the new height too.
+    fn adopt_manual_size(&mut self, drag: &ManualResize, window: egui::Vec2, ctx: &egui::Context) {
+        let Some(path) = self.current_path() else { return };
+        let Some((w, h)) = self.display_dims(&path) else { return };
+        let picture = egui::vec2(w as f32, h as f32);
+        let mut size = picture * drag.scale(window);
+        let monitor = ctx.input(|i| i.viewport().monitor_size);
+        if let Some(m) = monitor.filter(|m| m.x > 0.0 && m.y > 0.0) {
+            size *= (m.x / size.x).min(m.y / size.y).min(1.0);
+        }
+        let short = size.x.min(size.y);
+        if short < MIN_WINDOW_SIDE {
+            size *= MIN_WINDOW_SIDE / short;
+        }
+        let shared = self
+            .picture_window_size(&path, ctx)
+            .is_some_and(|s| (s.y - self.view_height).abs() < 0.5);
+        if shared {
+            self.view_height = size.y;
+        }
+        self.size_override = Some((path, size));
+    }
+
+    /// Window size for `path` at zoom 1: the picture as tall as
+    /// `view_height`, never enlarged past its own size, at least
+    /// MIN_WINDOW_SIDE on the short side and within ~95% of the monitor —
+    /// or the size the user gave it by resizing the window.
+    fn picture_window_size(&self, path: &Path, ctx: &egui::Context) -> Option<egui::Vec2> {
+        let (w, h) = self.display_dims(path)?;
+        let picture = egui::vec2(w as f32, h as f32);
+        if let Some((p, size)) = &self.size_override {
+            // Still the same picture, not rotated since.
+            if p == path && (size.x / size.y - picture.x / picture.y).abs() < 0.01 {
+                return Some(*size);
+            }
+        }
+        let monitor = ctx.input(|i| i.viewport().monitor_size);
+        Some(fit_picture_size(picture, self.view_height, monitor))
+    }
+
+    /// Scale from picture pixels to points for drawing `path` at zoom 1.
+    /// Windowed, that's the size the window is being fitted to, so while
+    /// the window is still resizing (or bigger, to hold a dialog) the picture
+    /// keeps its size instead of stretching; during an edge drag it follows
+    /// the drag. Fullscreen shows small pictures at their own size and fits
+    /// large ones to the screen.
+    fn base_scale(&self, path: &Path, ctx: &egui::Context, picture: egui::Vec2, avail: egui::Vec2) -> f32 {
+        let fit = (avail.x / picture.x).min(avail.y / picture.y);
+        let scale = if self.is_fullscreen {
+            fit.min(1.0)
+        } else if let Some(drag) = &self.manual_resize {
+            drag.scale(avail)
+        } else {
+            match self.picture_window_size(path, ctx) {
+                Some(size) => fit.min(size.y / picture.y),
+                None => fit,
+            }
+        };
+        scale.max(0.0001)
+    }
+
+    /// Room the open dialogs need. The window grows to at least this while
+    /// one is open, so a dialog over a small picture isn't cut off. Sizes
+    /// are what egui laid the dialog out at last time (a sidecar list or
+    /// long file names make it bigger), never below the usual size: in its
+    /// first frame a dialog is squeezed into the old, smaller window.
+    fn dialog_min_size(&self, ctx: &egui::Context) -> Option<egui::Vec2> {
+        const MARGIN: f32 = 8.0;
+        let last_rect = |title: &str| ctx.memory(|m| m.area_rect(egui::Id::new(title)));
+        let mut need: Option<egui::Vec2> = None;
+        let mut add = |v: egui::Vec2| need = Some(need.map_or(v, |n| n.max(v)));
+        // Centered: the dialog's size, with a margin all around.
+        let centered = [
+            (self.show_help, HELP_TITLE, egui::vec2(606.0, 366.0)),
+            (self.show_prefs, PREFS_TITLE, egui::vec2(374.0, 254.0)),
+            (self.pending_delete.is_some(), DELETE_TITLE, egui::vec2(374.0, 126.0)),
+        ];
+        for (open, title, usual) in centered {
+            if open {
+                let size = last_rect(title).map_or(usual, |r| r.size().max(usual));
+                add(size + egui::Vec2::splat(2.0 * MARGIN));
+            }
+        }
+        // The favorites window floats where egui put it (top left) or where
+        // the user moved it.
+        if self.show_filter {
+            let usual = egui::vec2(342.0, 166.0);
+            let corner = last_rect(FILTER_TITLE).map_or(usual, |r| r.max.to_vec2().max(usual));
+            add(corner + egui::Vec2::splat(MARGIN));
+        }
+        need
+    }
+
+    /// What the modal dialogs dim: the picture (or the start card), not the
+    /// whole window, which may be larger while a dialog needs the room.
+    fn dim_rect(&self, ctx: &egui::Context) -> (egui::Rect, f32) {
+        let screen = ctx.screen_rect();
+        if self.is_fullscreen {
+            return (screen, 0.0);
+        }
+        if self.images.is_empty() {
+            // The start card fills the window; same radius as the card.
+            return (screen, 14.0);
+        }
+        match self.last_image_rect {
+            Some(r) => (r.intersect(screen), CORNER_RADIUS),
+            None => (screen, CORNER_RADIUS),
+        }
     }
 
     /// Returns the on-screen (post-rotation) dimensions of the image, using
@@ -1990,42 +2143,8 @@ impl eframe::App for SnapView {
             }
         }
 
-        // In empty state the rendered card IS the window: size the window
-        // down to the card so there's no big dark frame around it.
-        if empty_state && !self.is_fullscreen {
-            let want = empty_state_card_size(self.prefs.recent.len(), self.show_help);
-            let needs_resize = self
-                .empty_state_size
-                .map(|prev| (prev.0 - want.0).abs() > 1.0 || (prev.1 - want.1).abs() > 1.0)
-                .unwrap_or(true);
-            if needs_resize {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(want.0, want.1)));
-                self.empty_state_size = Some(want);
-                // The next image needs a real window again, not one derived
-                // from the card's height.
-                self.restore_window_size = true;
-                self.last_resized_path = None;
-                // Cover the OS-side resize with an opaque panel for a few
-                // frames so the desktop doesn't flash through the rounded
-                // corners.
-                self.resize_settle_frames = 12;
-                ctx.request_repaint();
-            }
-        }
-        if !empty_state {
-            self.empty_state_size = None;
-        }
-        if !self.is_fullscreen {
-            self.maybe_resize_window_to_image(ctx);
-        }
-        // During an OS resize the window is transparent and the desktop shows
-        // through the rounded corners; hold the panel opaque for a few frames
-        // after an auto-resize to cover that window.
-        let settling = self.resize_settle_frames > 0;
-        if settling {
-            self.resize_settle_frames -= 1;
-            ctx.request_repaint();
-        }
+        // The window is exactly the picture (or the start card): see fit_window.
+        self.fit_window(ctx);
         // Custom window border resize: must run before the empty-state /
         // background interacts so it can claim the press when the cursor is
         // on an edge or corner.
@@ -2033,16 +2152,9 @@ impl eframe::App for SnapView {
 
         // Fullscreen is fully opaque. Windowed, the panel stays transparent
         // and what's painted on it is the window's visible shape: the rounded
-        // image, the rounded start card, or a rounded backdrop behind a zoomed
-        // image / loading placeholder (see render_image). Only during a resize
-        // settle window does the whole rectangle go opaque.
-        let bg_alpha: u8 = if self.is_fullscreen {
-            255
-        } else if settling {
-            235
-        } else {
-            0
-        };
+        // picture, the rounded start card, or a rounded backdrop behind a
+        // zoomed picture / loading placeholder (see render_image).
+        let bg_alpha: u8 = if self.is_fullscreen { 255 } else { 0 };
         let panel_frame = egui::Frame::none()
             .fill(egui::Color32::from_rgba_unmultiplied(13, 13, 13, bg_alpha));
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
@@ -2126,9 +2238,9 @@ impl eframe::App for SnapView {
         if actions.toggle_max {
             self.is_fullscreen = !self.is_fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
-            // Re-evaluate window sizing on next frame when leaving fullscreen.
-            self.last_resized_path = None;
-            self.last_aspect_class = None;
+            // Leaving fullscreen restores the old window size; fit it again.
+            self.requested_size = None;
+            self.manual_resize = None;
         }
         if actions.cycle_filter { self.cycle_filter(); }
         if actions.delete { self.request_delete(); }
@@ -2436,9 +2548,9 @@ impl SnapView {
             // image's known aspect so overlays/chevrons sit in the right
             // place during the brief decode window.
             self.last_image_rect = self.display_dims(&path).map(|(w, h)| {
-                let (w, h) = (w as f32, h as f32);
-                let scale = (avail.x / w).min(avail.y / h).min(1.0).max(0.0001) * self.zoom;
-                egui::Rect::from_center_size(avail_rect.center() + self.pan, egui::vec2(w, h) * scale)
+                let picture = egui::vec2(w as f32, h as f32);
+                let scale = self.base_scale(&path, ctx, picture, avail) * self.zoom;
+                egui::Rect::from_center_size(avail_rect.center() + self.pan, picture * scale)
             });
             let painter = ui.painter();
             // Until the picture arrives the backdrop is the window's visible
@@ -2501,7 +2613,7 @@ impl SnapView {
         } else {
             (src.y, src.x)
         };
-        let base_scale = (avail.x / fit_w).min(avail.y / fit_h).min(1.0).max(0.0001);
+        let base_scale = self.base_scale(&draw_path, ctx, egui::vec2(fit_w, fit_h), avail);
 
         // Keep the picture on screen: zoomed in, it can't be dragged past its
         // own edges; smaller than the window, it stays centered.
@@ -2518,11 +2630,13 @@ impl SnapView {
         let quad = src * scale;
         let center = avail_rect.center() + self.pan;
         let shown = egui::Rect::from_center_size(center, egui::vec2(fit_w, fit_h) * scale);
-        if !self.is_fullscreen && (self.zoom > 1.001 || self.target_zoom > 1.001) {
+        let zoomed = self.zoom > 1.001 || self.target_zoom > 1.001;
+        if !self.is_fullscreen && (zoomed || self.manual_resize.is_some()) {
             // Zoomed in, the picture spills past the window and can't carry
             // the rounded corners itself: paint the window's rounded shape
             // behind it so the window stays rounded (this also fills the bars
-            // beside a picture that is still narrower than the window).
+            // beside a picture that is still narrower than the window, as
+            // during an edge drag, before the window snaps to the picture).
             ui.painter().rect_filled(avail_rect, CORNER_RADIUS, backdrop_color());
         }
         // Only the part inside the window is drawn, rounded where it meets a
@@ -3069,13 +3183,14 @@ impl SnapView {
             .unwrap_or_default();
 
         let screen = ctx.screen_rect();
+        let (dim, radius) = self.dim_rect(ctx);
         egui::Area::new(egui::Id::new("delete_dim"))
             .fixed_pos(screen.min)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.painter().rect_filled(
-                    screen,
-                    0.0,
+                    dim,
+                    radius,
                     egui::Color32::from_rgba_premultiplied(0, 0, 0, 140),
                 );
                 ui.allocate_rect(screen, egui::Sense::click());
@@ -3083,7 +3198,7 @@ impl SnapView {
 
         let mut do_confirm = false;
         let mut do_cancel = false;
-        egui::Window::new("Delete?")
+        egui::Window::new(DELETE_TITLE)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -3126,13 +3241,14 @@ impl SnapView {
 
     fn render_help(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
+        let (dim, radius) = self.dim_rect(ctx);
         egui::Area::new(egui::Id::new("help_dim"))
             .fixed_pos(screen.min)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.painter().rect_filled(
-                    screen,
-                    0.0,
+                    dim,
+                    radius,
                     egui::Color32::from_rgba_premultiplied(0, 0, 0, 180),
                 );
                 if ui.allocate_rect(screen, egui::Sense::click()).clicked() {
@@ -3162,7 +3278,7 @@ impl SnapView {
             ("Close dialog / leave fullscreen / quit", "Esc"),
         ];
 
-        egui::Window::new("Keyboard shortcuts")
+        egui::Window::new(HELP_TITLE)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -3245,13 +3361,14 @@ impl SnapView {
 
     fn render_prefs(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
+        let (dim, radius) = self.dim_rect(ctx);
         egui::Area::new(egui::Id::new("prefs_dim"))
             .fixed_pos(screen.min)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.painter().rect_filled(
-                    screen,
-                    0.0,
+                    dim,
+                    radius,
                     egui::Color32::from_rgba_premultiplied(0, 0, 0, 140),
                 );
                 ui.allocate_rect(screen, egui::Sense::click());
@@ -3259,7 +3376,7 @@ impl SnapView {
 
         let mut close = false;
         let mut theme_changed: Option<ThemeMode> = None;
-        egui::Window::new("Preferences")
+        egui::Window::new(PREFS_TITLE)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -3320,7 +3437,7 @@ impl SnapView {
         let mut do_select_none = false;
         let busy = self.file_job.is_some();
 
-        egui::Window::new("Filter favorites & copy/cut")
+        egui::Window::new(FILTER_TITLE)
             .open(&mut open)
             .resizable(true)
             .default_size([520.0, 600.0])
@@ -3589,6 +3706,27 @@ fn show_native_menu(entries: &[MenuEntry], dark: bool) -> Option<MenuCmd> {
     }
 }
 
+/// Whether a mouse button is held down right now. An edge drag runs in the
+/// OS's own loop, which doesn't reliably tell egui when the button comes
+/// back up (the release is lost if the pointer left the window). Physical
+/// buttons, so swapped buttons are covered.
+#[cfg(windows)]
+fn mouse_button_held() -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(key: i32) -> i16;
+    }
+    const VK_LBUTTON: i32 = 0x01;
+    const VK_RBUTTON: i32 = 0x02;
+    unsafe { GetAsyncKeyState(VK_LBUTTON) < 0 || GetAsyncKeyState(VK_RBUTTON) < 0 }
+}
+
+/// Elsewhere a pause in the size changes has to do.
+#[cfg(not(windows))]
+fn mouse_button_held() -> bool {
+    false
+}
+
 /// Make Win32 popup menus follow the app's theme. Windows only offers this
 /// through two undocumented uxtheme exports, SetPreferredAppMode (#135) and
 /// FlushMenuThemes (#136), stable since Windows 10 1903 (build 18362) and
@@ -3691,34 +3829,26 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// 1 for portrait (narrower than ~square), 0 for landscape / square.
-fn aspect_class(w: usize, h: usize) -> i8 {
-    if (w as f32) < (h as f32) * 0.95 { 1 } else { 0 }
-}
-
-/// Window size that shows an image of `aspect` at `height`, scaled down to
-/// fit 95% of the monitor when we know its size (panoramas, tall scans).
-fn fit_window_to_aspect(aspect: f32, height: f32, monitor: Option<egui::Vec2>) -> (f32, f32) {
-    let mut h = height.max(150.0);
-    let mut w = h * aspect;
-    if let Some(m) = monitor.filter(|m| m.x > 0.0 && m.y > 0.0) {
-        let (max_w, max_h) = (m.x * 0.95, m.y * 0.95);
-        if h > max_h {
-            h = max_h;
-            w = h * aspect;
-        }
-        if w > max_w {
-            w = max_w;
-            h = w / aspect;
-        }
+/// Window size (points) for a picture of `picture` points: as tall as
+/// `view_height` but never enlarged past its own size, at least
+/// MIN_WINDOW_SIDE on the short side, and within 95% of the monitor.
+fn fit_picture_size(picture: egui::Vec2, view_height: f32, monitor: Option<egui::Vec2>) -> egui::Vec2 {
+    let mut size = picture * (view_height / picture.y).min(1.0);
+    let short = size.x.min(size.y);
+    if short < MIN_WINDOW_SIDE {
+        size *= MIN_WINDOW_SIDE / short;
     }
-    (w.max(200.0), h.max(120.0))
+    if let Some(m) = monitor.filter(|m| m.x > 0.0 && m.y > 0.0) {
+        size *= (m.x * 0.95 / size.x).min(m.y * 0.95 / size.y).min(1.0);
+    }
+    size
 }
 
 /// Window dimensions for the empty-state card. Sized just large enough to
 /// fit the header, drop zone, up-to-5 recent rows and the bottom hint strip
-/// — anything more and the user sees a tall empty rectangle.
-fn empty_state_card_size(recent_count: usize, show_help: bool) -> (f32, f32) {
+/// — anything more and the user sees a tall empty rectangle. (An open F1
+/// help grows the window further; see dialog_min_size.)
+fn empty_state_card_size(recent_count: usize) -> egui::Vec2 {
     let n = recent_count.min(5);
     let header = 4.0 + 26.0 + 1.0 + 16.0 + 16.0;
     let drop_zone = 96.0 + 18.0;
@@ -3726,15 +3856,7 @@ fn empty_state_card_size(recent_count: usize, show_help: bool) -> (f32, f32) {
     let hint_strip = 24.0;
     let padding = 22.0 * 2.0;
     let h = header + drop_zone + recents + hint_strip + padding;
-    if show_help {
-        // The F1 help is a centered egui Window with min_width 560 plus its
-        // own padding, two columns of shortcuts and a few footer lines. The
-        // start-screen card is much smaller than that — expand the OS window
-        // so the help dialog isn't clipped.
-        (640.0_f32.max(440.0), 460.0_f32.max(h))
-    } else {
-        (440.0, h)
-    }
+    egui::vec2(440.0, h)
 }
 
 /// Compact one-line label for a recent-folder entry: the last two path
@@ -3940,14 +4062,14 @@ struct Probe {
 }
 
 impl Probe {
-    /// Width / height as displayed.
-    fn display_aspect(&self) -> Option<f32> {
+    /// Pixel size as displayed (EXIF rotation applied).
+    fn display_size(&self) -> Option<egui::Vec2> {
         let [w, h] = self.dims?;
         if w == 0 || h == 0 {
             return None;
         }
         let (w, h) = if self.quarter.rem_euclid(2) == 1 { (h, w) } else { (w, h) };
-        Some(w as f32 / h as f32)
+        Some(egui::vec2(w as f32, h as f32))
     }
 }
 
@@ -4994,7 +5116,7 @@ mod tests {
         let probe = probe_image(&path);
         assert_eq!(probe.dims, Some([400, 300]));
         assert_eq!(probe.quarter, 1);
-        assert!((probe.display_aspect().unwrap() - 0.75).abs() < 1e-6);
+        assert_eq!(probe.display_size(), Some(egui::vec2(300.0, 400.0)));
         assert_eq!(probe.thumb.as_ref().map(|t| t.size), Some([16, 12]));
 
         let d = decode_full(&path, 2400, 8192).unwrap();
@@ -5133,16 +5255,42 @@ mod tests {
     }
 
     #[test]
-    fn window_sizes_fit_monitor() {
-        assert_eq!(initial_window_size(None), [1200.0, 800.0]);
-        assert_eq!(initial_window_size(Some(0.75)), [600.0, 800.0]);
-        let [w, h] = initial_window_size(Some(8.0));
-        assert!(w <= 1600.0 && h >= 200.0);
-        let (w, h) = fit_window_to_aspect(8.0, 800.0, Some(egui::vec2(1920.0, 1080.0)));
-        assert!(w <= 1920.0 * 0.95 + 0.01);
-        assert!((w / h - 8.0).abs() < 0.01);
-        assert_eq!(aspect_class(3024, 4032), 1);
-        assert_eq!(aspect_class(4032, 3024), 0);
+    fn window_is_sized_to_the_picture() {
+        let close = |a: egui::Vec2, b: egui::Vec2| (a - b).length() < 0.01;
+        let monitor = Some(egui::vec2(1920.0, 1080.0));
+        // Large photos are as tall as the view height, whatever their shape.
+        assert!(close(fit_picture_size(egui::vec2(6000.0, 4000.0), 800.0, monitor), egui::vec2(1200.0, 800.0)));
+        assert!(close(fit_picture_size(egui::vec2(3000.0, 4000.0), 800.0, monitor), egui::vec2(600.0, 800.0)));
+        // A small picture keeps its own size instead of leaving empty margins.
+        assert!(close(fit_picture_size(egui::vec2(640.0, 480.0), 800.0, monitor), egui::vec2(640.0, 480.0)));
+        // A tiny one is scaled up to a usable window.
+        assert!(close(fit_picture_size(egui::vec2(64.0, 32.0), 800.0, monitor), egui::vec2(320.0, 160.0)));
+        // A panorama is shrunk to fit the monitor, aspect kept.
+        let pano = fit_picture_size(egui::vec2(24000.0, 3000.0), 800.0, monitor);
+        assert!(pano.x <= 1920.0 * 0.95 + 0.01 && (pano.x / pano.y - 8.0).abs() < 0.01);
+        assert!(close(initial_window_size(None), egui::vec2(1200.0, 800.0)));
+        assert!(close(initial_window_size(Some(egui::vec2(3024.0, 4032.0))), egui::vec2(600.0, 800.0)));
+    }
+
+    #[test]
+    fn edge_drag_scales_by_the_side_that_moved() {
+        // A 6000x4000 photo in a 1200x800 window.
+        let drag = ManualResize {
+            start_size: egui::vec2(1200.0, 800.0),
+            start_scale: 0.2,
+            last_size: egui::vec2(1200.0, 800.0),
+            changed_at: Instant::now(),
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        // Right edge pulled out: the picture grows with the width, and the
+        // window then grows taller to match.
+        assert!(close(drag.scale(egui::vec2(1500.0, 800.0)), 0.25));
+        // Bottom edge pulled up: it shrinks with the height.
+        assert!(close(drag.scale(egui::vec2(1200.0, 400.0)), 0.1));
+        // Corner: the side that changed more wins.
+        assert!(close(drag.scale(egui::vec2(1800.0, 900.0)), 0.3));
+        // A click on the edge that doesn't move it changes nothing.
+        assert!(close(drag.scale(egui::vec2(1200.0, 800.0)), 0.2));
     }
 
     #[test]
